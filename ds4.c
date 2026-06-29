@@ -11324,6 +11324,28 @@ static bool metal_graph_install_model_spans(
     return ok;
 }
 
+static bool metal_graph_map_full_model(
+        const ds4_model *model,
+        const char      *label) {
+    if (!model ||
+        !model->map ||
+        model->size == 0 ||
+        model->tensor_data_pos >= model->size) {
+        return false;
+    }
+    const bool ok = ds4_gpu_set_model_map_range(model->map,
+                                                model->size,
+                                                model->tensor_data_pos,
+                                                model->size - model->tensor_data_pos,
+                                                model->max_tensor_bytes) != 0;
+    if (!ok) {
+        fprintf(stderr,
+                "ds4: Metal SSD streaming failed to map %s full model view\n",
+                label ? label : "requested");
+    }
+    return ok;
+}
+
 static bool metal_graph_stream_readahead_enabled(void) {
     return getenv("DS4_METAL_ENABLE_STREAMING_READAHEAD") != NULL &&
            getenv("DS4_METAL_DISABLE_STREAMING_READAHEAD") == NULL;
@@ -11630,6 +11652,42 @@ static bool metal_graph_stream_prefill_batch_selected_addr_enabled(
     const uint32_t min_tokens =
         metal_graph_stream_prefill_batch_selected_addr_auto_min();
     return max_tokens != 0 && n_tokens >= min_tokens && n_tokens <= max_tokens;
+}
+
+static bool metal_graph_mtp_verify_selected_addr_enabled(
+        const ds4_gpu_graph *g,
+        const ds4_weights   *weights,
+        uint32_t             n_tokens) {
+#ifdef __APPLE__
+    if (!g ||
+        !g->ssd_streaming ||
+        g->quality ||
+        !weights ||
+        n_tokens <= 1 ||
+        n_tokens > 4 ||
+        getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") != NULL ||
+        getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE") != NULL ||
+        getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL ||
+        getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL ||
+        DS4_N_LAYER == 0 ||
+        DS4_N_EXPERT_USED != 6 ||
+        weights->layer[0].ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
+        weights->layer[0].ffn_up_exps->type != DS4_TENSOR_IQ2_XXS ||
+        weights->layer[0].ffn_down_exps->type != DS4_TENSOR_Q2_K) {
+        return false;
+    }
+
+    const uint64_t selected_upper_bound =
+        (uint64_t)n_tokens * (uint64_t)DS4_N_EXPERT_USED;
+    return selected_upper_bound <= UINT32_MAX &&
+           ds4_gpu_stream_expert_cache_configured_count() >=
+               (uint32_t)selected_upper_bound;
+#else
+    (void)g;
+    (void)weights;
+    (void)n_tokens;
+    return false;
+#endif
 }
 
 static bool metal_graph_cuda_stream_prefill_batch_selected_addr_enabled(
@@ -16270,13 +16328,10 @@ static bool metal_graph_matmul_q8_0_named_tensor(
     return ok;
 }
 
-static bool metal_graph_encode_output_head_mtp(
+static bool metal_graph_encode_output_head_mtp_hidden(
         ds4_gpu_graph       *g,
-        const ds4_model       *base_model,
-        const ds4_weights     *base_weights,
         const ds4_model       *mtp_model,
-        const ds4_mtp_weights *mtp,
-        uint64_t               vocab_dim) {
+        const ds4_mtp_weights *mtp) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->output_pre, mtp_model, mtp->hc_head_fn,
@@ -16301,6 +16356,15 @@ static bool metal_graph_encode_output_head_mtp(
                                                   mtp->norm->abs_offset,
                                                   DS4_N_EMBD,
                                                   DS4_RMS_EPS) != 0;
+    return ok;
+}
+
+static bool metal_graph_encode_output_head_mtp_project(
+        ds4_gpu_graph   *g,
+        const ds4_model   *base_model,
+        const ds4_weights *base_weights,
+        uint64_t           vocab_dim) {
+    bool ok = true;
     if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->logits,
                                               base_model->map,
                                               base_model->size,
@@ -16309,6 +16373,21 @@ static bool metal_graph_encode_output_head_mtp(
                                               vocab_dim,
                                               g->output_norm,
                                               1) != 0;
+    return ok;
+}
+
+static bool metal_graph_encode_output_head_mtp(
+        ds4_gpu_graph       *g,
+        const ds4_model       *base_model,
+        const ds4_weights     *base_weights,
+        const ds4_model       *mtp_model,
+        const ds4_mtp_weights *mtp,
+        uint64_t               vocab_dim) {
+    bool ok = metal_graph_encode_output_head_mtp_hidden(g, mtp_model, mtp);
+    if (ok) ok = metal_graph_encode_output_head_mtp_project(g,
+                                                            base_model,
+                                                            base_weights,
+                                                            vocab_dim);
     return ok;
 }
 
@@ -19943,7 +20022,13 @@ static bool metal_graph_eval_mtp_draft_from_hc(
 
     ds4_gpu_tensor *saved_cur = g->cur_hc;
     ds4_gpu_tensor *saved_after = g->after_ffn_hc;
-    bool ok = ds4_gpu_begin_commands() != 0;
+    const bool streaming = g->ssd_streaming;
+    bool ok = true;
+    if (streaming) {
+        g->streaming_static_decode_map_current = false;
+        ok = metal_graph_stream_map_token(base_model, base_weights);
+    }
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = ds4_gpu_embed_token_hc_tensor(g->mtp_embed,
                                                   base_model->map,
                                                   base_model->size,
@@ -19952,6 +20037,9 @@ static bool metal_graph_eval_mtp_draft_from_hc(
                                                   (uint32_t)token,
                                                   DS4_N_EMBD,
                                                   1) != 0;
+    if (ok && streaming) ok = ds4_gpu_end_commands() != 0;
+    if (ok && streaming) ok = metal_graph_map_full_model(mtp_model, "MTP support");
+    if (ok && streaming) ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->mtp_enorm,
                                                   g->mtp_embed,
                                                   mtp_model->map,
@@ -19994,6 +20082,13 @@ static bool metal_graph_eval_mtp_draft_from_hc(
     if (ok) {
         g->cur_hc = g->mtp_input_hc;
         g->after_ffn_hc = out_hc;
+        /*
+         * The MTP support model is kept resident when the base model is SSD
+         * streamed.  Avoid routing this one-block support model through the
+         * base model's layer/expert streaming cache namespace.
+         */
+        const bool saved_streaming = g->ssd_streaming;
+        if (streaming) g->ssd_streaming = false;
         ok = metal_graph_encode_decode_layer(g,
                                              mtp_model,
                                              &mtp->block,
@@ -20004,14 +20099,32 @@ static bool metal_graph_eval_mtp_draft_from_hc(
                                              raw_row,
                                              n_raw,
                                              token);
+        g->ssd_streaming = saved_streaming;
     }
+    if (ok && streaming) {
+        g->cur_hc = out_hc;
+        ok = metal_graph_encode_output_head_mtp_hidden(g, mtp_model, mtp);
+    }
+    if (ok && streaming) ok = ds4_gpu_end_commands() != 0;
+    if (ok && streaming) {
+        g->streaming_static_decode_map_current = false;
+        ok = metal_graph_stream_map_output(base_model, base_weights);
+    }
+    if (ok && streaming) ok = ds4_gpu_begin_commands() != 0;
     if (ok) g->cur_hc = out_hc;
-    if (ok) ok = metal_graph_encode_output_head_mtp(g,
-                                                    base_model,
-                                                    base_weights,
-                                                    mtp_model,
-                                                    mtp,
-                                                    base_weights->output->dim[1]);
+    if (ok && streaming) {
+        ok = metal_graph_encode_output_head_mtp_project(g,
+                                                        base_model,
+                                                        base_weights,
+                                                        base_weights->output->dim[1]);
+    } else if (ok) {
+        ok = metal_graph_encode_output_head_mtp(g,
+                                                base_model,
+                                                base_weights,
+                                                mtp_model,
+                                                mtp,
+                                                base_weights->output->dim[1]);
+    }
     if (ok && top_id) {
         ok = ds4_gpu_argmax_tensor(g->comp_selected,
                                    g->logits,
@@ -21129,7 +21242,16 @@ static bool metal_graph_verify_suffix_tops(
     const uint32_t top_rows = n_tokens > 1 ? n_tokens - 1 : 0;
     if (top_rows && !row_tops) return false;
 
-    bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
+    const bool streaming = g->ssd_streaming;
+    const bool batch_selected_addr =
+        streaming &&
+        metal_graph_mtp_verify_selected_addr_enabled(g, weights, n_tokens);
+    bool ok = true;
+    if (streaming) {
+        g->streaming_static_decode_map_current = false;
+        ok = metal_graph_stream_map_token(model, weights);
+    }
+    if (ok) ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
     if (ok) ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
                                                          g->prefill_tokens,
                                                          model,
@@ -21142,21 +21264,60 @@ static bool metal_graph_verify_suffix_tops(
     const bool saved_capture = g->spec_capture_prefix1;
     g->spec_capture_prefix1 = capture_prefix1 && n_tokens == 2;
 
-    ok = ds4_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        ok = metal_graph_encode_layer_batch(g,
-                                            model,
-                                            &weights->layer[il],
-                                            il,
-                                            start,
-                                            n_tokens);
+    if (batch_selected_addr) {
+        ds4_gpu_set_streaming_tiny_batch_selected_addr(true);
     }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    else (void)ds4_gpu_synchronize();
+    if (streaming) {
+        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            g->streaming_static_decode_map_current = false;
+            ok = batch_selected_addr ?
+                 metal_graph_stream_map_layer_decode(model, weights, il) :
+                 metal_graph_stream_map_layer(model, weights, il);
+            if (ok && il + 1 < DS4_N_LAYER) {
+                if (batch_selected_addr) {
+                    metal_graph_stream_readahead_layer_decode(model, weights, il + 1);
+                } else {
+                    metal_graph_stream_readahead_layer(model, weights, il + 1);
+                }
+            } else if (ok) {
+                metal_graph_stream_readahead_output(model, weights);
+            }
+            if (ok) ok = ds4_gpu_begin_commands() != 0;
+            if (ok) {
+                ok = metal_graph_encode_layer_batch(g,
+                                                    model,
+                                                    &weights->layer[il],
+                                                    il,
+                                                    start,
+                                                    n_tokens);
+            }
+            if (ok) ok = ds4_gpu_end_commands() != 0;
+            else (void)ds4_gpu_synchronize();
+        }
+    } else {
+        ok = ds4_gpu_begin_commands() != 0;
+        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            ok = metal_graph_encode_layer_batch(g,
+                                                model,
+                                                &weights->layer[il],
+                                                il,
+                                                start,
+                                                n_tokens);
+        }
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+    }
+    if (batch_selected_addr) {
+        ds4_gpu_set_streaming_tiny_batch_selected_addr(false);
+    }
     g->spec_capture_prefix1 = saved_capture;
     if (!ok) return false;
 
-    ok = ds4_gpu_begin_commands() != 0;
+    if (streaming) {
+        g->streaming_static_decode_map_current = false;
+        ok = metal_graph_stream_map_output(model, weights);
+    }
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = metal_graph_encode_output_head_batch(g,
                                                       model,
                                                       weights,
@@ -21164,7 +21325,7 @@ static bool metal_graph_verify_suffix_tops(
                                                       weights->output->dim[1]);
     if (ok) {
         if (top_rows == 1) {
-            /* Common K=2 verify case: top_k=1 over n_vocab → use the dedicated
+            /* Common K=2 verify case: top_k=1 over n_vocab: use the dedicated
              * argmax kernel (single-block tree-reduce) instead of the legacy
              * indexer_topk_kernel's single-thread O(n_vocab * top_k) fall-through. */
             ok = ds4_gpu_argmax_tensor(g->comp_selected,
@@ -25407,6 +25568,16 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
                 "ds4: SSD streaming auto cache could not measure non-routed model weights\n");
         return false;
     }
+    uint64_t mtp_resident_bytes = 0;
+    if (e->mtp_ready && e->mtp_model.size > e->mtp_model.tensor_data_pos) {
+        mtp_resident_bytes = e->mtp_model.size - e->mtp_model.tensor_data_pos;
+        if (UINT64_MAX - non_routed_bytes < mtp_resident_bytes) {
+            fprintf(stderr,
+                    "ds4: SSD streaming auto cache could not account for resident MTP model size\n");
+            return false;
+        }
+        non_routed_bytes += mtp_resident_bytes;
+    }
 
     uint64_t per_expert_bytes = 0;
     if (!ds4_streaming_routed_expert_bytes(&e->weights, &per_expert_bytes)) {
@@ -25440,6 +25611,11 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
     fprintf(stderr,
             "ds4:   non-routed weights: %.2f GiB\n",
             (double)non_routed_bytes / 1073741824.0);
+    if (mtp_resident_bytes != 0) {
+        fprintf(stderr,
+                "ds4:   resident MTP support model: %.2f GiB\n",
+                (double)mtp_resident_bytes / 1073741824.0);
+    }
     fprintf(stderr,
             "ds4:   routed expert size: %.2f MiB\n",
             (double)per_expert_bytes / 1048576.0);
@@ -25681,18 +25857,16 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
     if (opt->mtp_path && opt->mtp_path[0] &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
-        if (e->ssd_streaming) {
-            fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp yet\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
         fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
                 opt->mtp_path,
                 e->mtp_draft_tokens);
+        if (e->ssd_streaming) {
+            fprintf(stderr,
+                    "ds4: SSD streaming enabled with resident MTP support model\n");
+        }
     }
 
 #ifndef DS4_NO_GPU

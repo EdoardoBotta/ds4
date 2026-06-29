@@ -267,6 +267,7 @@ static int g_stream_prefill_batch_selected_addr_building;
 static uint64_t g_model_residency_count;
 static int g_model_residency_added_to_queue;
 static int g_ssd_streaming_mode;
+static int g_streaming_tiny_batch_selected_addr;
 static int g_metal4_runtime_available;
 static int g_metal4_family_supported;
 static int g_metal4_queue_supported;
@@ -2946,6 +2947,10 @@ void ds4_gpu_set_ssd_streaming(bool enabled) {
         fprintf(stderr,
                 "ds4: Metal SSD streaming mode enabled; full model residency and warmup are skipped\n");
     }
+}
+
+void ds4_gpu_set_streaming_tiny_batch_selected_addr(bool enabled) {
+    g_streaming_tiny_batch_selected_addr = enabled ? 1 : 0;
 }
 
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
@@ -8871,7 +8876,11 @@ static int ds4_gpu_stream_prefill_batch_selected_addr_enabled(
         getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") != NULL) {
         return 0;
     }
-    if (ds4_gpu_stream_expert_cache_configured_count() < n_total_expert) {
+    const uint64_t required_cache = g_streaming_tiny_batch_selected_addr ?
+        (uint64_t)n_tokens * (uint64_t)n_expert :
+        (uint64_t)n_total_expert;
+    if (required_cache > UINT32_MAX ||
+        ds4_gpu_stream_expert_cache_configured_count() < (uint32_t)required_cache) {
         return 0;
     }
     if (getenv("DS4_METAL_ENABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") != NULL) {

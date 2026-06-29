@@ -2766,6 +2766,10 @@ extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     }
 }
 
+extern "C" void ds4_gpu_set_streaming_tiny_batch_selected_addr(bool enabled) {
+    (void)enabled;
+}
+
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     g_stream_expert_budget_override = experts;
     g_stream_expert_runtime_cap = 0;
