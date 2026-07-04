@@ -26,6 +26,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+extension View {
+    /// The rounded, filled-and-stroked "card" look shared by info boxes, tool
+    /// rows, and code/table blocks throughout the chat UI.
+    func cardBackground(
+        cornerRadius: CGFloat,
+        fill: Color,
+        stroke: Color = Color(nsColor: .separatorColor),
+        lineWidth: CGFloat = 1
+    ) -> some View {
+        self
+            .background(RoundedRectangle(cornerRadius: cornerRadius).fill(fill))
+            .overlay(RoundedRectangle(cornerRadius: cornerRadius).stroke(stroke, lineWidth: lineWidth))
+    }
+
+    /// The capsule pill background shared by the status/metric pills in the header.
+    func pillBackground() -> some View {
+        self
+            .background(Capsule().fill(Color(nsColor: .controlBackgroundColor)))
+            .overlay(Capsule().stroke(Color(nsColor: .separatorColor), lineWidth: 1))
+    }
+
+    /// Constrains content to `maxWidth`, centered (or aligned) within the
+    /// available width -- the "readable column" idiom used by the main panels.
+    func columnWidth(_ maxWidth: CGFloat, alignment: Alignment = .center) -> some View {
+        self
+            .frame(maxWidth: maxWidth, alignment: alignment)
+            .frame(maxWidth: .infinity, alignment: alignment)
+    }
+
+    /// Selectable text in the standard label color, used for markdown-rendered
+    /// prose, table cells, and code blocks alike.
+    func selectableLabel() -> some View {
+        self
+            .foregroundStyle(Color(nsColor: .labelColor))
+            .textSelection(.enabled)
+    }
+}
+
 private enum Defaults {
     static let agentPath = findExistingPath([
         FileManager.default.currentDirectoryPath + "/ds4-agent",
@@ -88,14 +126,19 @@ struct ChatMessage: Identifiable {
     }
 }
 
+/// A ratio of `value`/`total` clamped to 0...1, or `nil` when `total` isn't positive.
+private func clampedFraction(_ value: Int, of total: Int) -> Double? {
+    guard total > 0 else { return nil }
+    return min(max(Double(value) / Double(total), 0), 1)
+}
+
 struct ContextStatus {
     var used: Int = 0
     var total: Int = 0
     var generationTokensPerSecond: Double = 0
 
     var usageFraction: Double? {
-        guard total > 0 else { return nil }
-        return min(max(Double(used) / Double(total), 0), 1)
+        clampedFraction(used, of: total)
     }
 
     var usagePercentText: String {
@@ -216,9 +259,7 @@ final class DS4Runner: ObservableObject {
                 self?.outputPipe = nil
                 self?.errorPipe = nil
                 self?.isEngineRunning = false
-                if self?.isGenerating == true {
-                    self?.isGenerating = false
-                }
+                self?.isGenerating = false
                 self?.prefillProgress = nil
                 self?.status = process.terminationStatus == 0 ? "Agent stopped" : "Agent exited with code \(process.terminationStatus)"
             }
@@ -493,8 +534,7 @@ struct PrefillProgress {
     }
 
     var fraction: Double? {
-        guard total > 0 else { return nil }
-        return min(max(Double(done) / Double(total), 0), 1)
+        clampedFraction(done, of: total)
     }
 
     var detail: String {
@@ -670,8 +710,7 @@ struct ContentView: View {
         }
         .padding(.horizontal, 20)
         .padding(.bottom, 14)
-        .frame(maxWidth: 920)
-        .frame(maxWidth: .infinity)
+        .columnWidth(920)
         .background(Color(nsColor: .controlBackgroundColor))
     }
 
@@ -720,8 +759,7 @@ struct ContentView: View {
                     .padding(.horizontal, 24)
                     .padding(.top, 26)
                     .padding(.bottom, 34)
-                    .frame(maxWidth: 920)
-                    .frame(maxWidth: .infinity)
+                    .columnWidth(920)
                 }
                 .background(chatBackground)
                 .onChange(of: runner.latestUserMessageID) { _ in
@@ -859,8 +897,7 @@ struct ContentView: View {
         .padding(.horizontal, 24)
         .padding(.top, 14)
         .padding(.bottom, 16)
-        .frame(maxWidth: 920)
-        .frame(maxWidth: .infinity)
+        .columnWidth(920)
         .background(.regularMaterial)
     }
 
@@ -1064,25 +1101,15 @@ private struct WebApprovalNoticeBox: View {
             Spacer()
         }
         .padding(14)
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(Color.orange.opacity(0.10))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(Color.orange.opacity(0.35), lineWidth: 1)
-        )
-        .frame(maxWidth: 720, alignment: .leading)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .cardBackground(cornerRadius: 12, fill: Color.orange.opacity(0.10), stroke: Color.orange.opacity(0.35))
+        .columnWidth(720, alignment: .leading)
     }
 }
 
 private struct StartupDetailsBox: View {
     let lines: [String]
 
-    private var details: StartupDetails {
-        StartupDetails(lines: lines)
-    }
+    @State private var items: [StartupInfoItem] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -1107,23 +1134,17 @@ private struct StartupDetailsBox: View {
                 alignment: .leading,
                 spacing: 10
             ) {
-                ForEach(details.items) { item in
+                ForEach(items) { item in
                     StartupInfoTile(item: item)
                 }
             }
         }
         .padding(16)
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(Color.accentColor.opacity(0.09))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(Color.accentColor.opacity(0.32), lineWidth: 1.5)
-        )
+        .cardBackground(cornerRadius: 12, fill: Color.accentColor.opacity(0.09), stroke: Color.accentColor.opacity(0.32), lineWidth: 1.5)
         .shadow(color: Color.black.opacity(0.08), radius: 12, x: 0, y: 5)
-        .frame(maxWidth: 760, alignment: .leading)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .columnWidth(760, alignment: .leading)
+        .onAppear { items = StartupDetails(lines: lines).items }
+        .onChange(of: lines) { newLines in items = StartupDetails(lines: newLines).items }
     }
 }
 
@@ -1196,22 +1217,15 @@ private struct StartupDetails {
             .trimmingCharacters(in: CharacterSet(charactersIn: "()"))
             .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-        var values: [String: String] = [:]
-        for option in options {
-            let pair = option.split(separator: "=", maxSplits: 1).map(String.init)
-            if pair.count == 2 {
-                values[pair[0]] = pair[1]
-            }
-        }
-        return values["ctx"] ?? "-"
+        guard let ctxOption = options.first(where: { $0.hasPrefix("ctx=") }) else { return "-" }
+        return String(ctxOption.dropFirst("ctx=".count))
     }
 
     private static func parseExpertCacheMemory(_ lines: [String]) -> String? {
-        if let line = lines.last(where: { $0.contains("SSD streaming cache budget") && $0.contains("GiB") }) {
-            return Self.gibValue(from: line)
-        }
-        if let line = lines.last(where: { $0.contains("cached expert count") && $0.contains("GiB") }) {
-            return Self.gibValue(from: line)
+        for marker in ["SSD streaming cache budget", "cached expert count"] {
+            if let line = lines.last(where: { $0.contains(marker) && $0.contains("GiB") }) {
+                return Self.gibValue(from: line)
+            }
         }
         return nil
     }
@@ -1233,13 +1247,7 @@ private struct StartupDetails {
     }
 
     private static func withThousandsSeparator(_ raw: String) -> String {
-        guard let value = Int(raw) else { return raw }
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        formatter.usesGroupingSeparator = true
-        formatter.groupingSeparator = ","
-        formatter.groupingSize = 3
-        return formatter.string(from: NSNumber(value: value)) ?? raw
+        Int(raw).map { $0.formatted() } ?? raw
     }
 }
 
@@ -1272,14 +1280,7 @@ private struct StartupInfoTile: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, minHeight: 82, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(nsColor: .textBackgroundColor))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
-        )
+        .cardBackground(cornerRadius: 10, fill: Color(nsColor: .textBackgroundColor))
     }
 }
 
@@ -1295,6 +1296,8 @@ private struct ZoneSlider: View {
 
     private let thumbDiameter: CGFloat = 14
     private let trackHeight: CGFloat = 4
+
+    private var controlHeight: CGFloat { max(thumbDiameter, trackHeight) }
 
     private func fraction(of v: Double) -> CGFloat {
         let span = range.upperBound - range.lowerBound
@@ -1326,7 +1329,7 @@ private struct ZoneSlider: View {
                     .frame(width: thumbDiameter, height: thumbDiameter)
                     .offset(x: thumbX)
             }
-            .frame(height: max(thumbDiameter, trackHeight))
+            .frame(height: controlHeight)
             .contentShape(Rectangle())
             .gesture(
                 DragGesture(minimumDistance: 0)
@@ -1339,7 +1342,7 @@ private struct ZoneSlider: View {
                     }
             )
         }
-        .frame(height: max(thumbDiameter, trackHeight))
+        .frame(height: controlHeight)
     }
 }
 
@@ -1361,14 +1364,7 @@ private struct StatusPill: View {
         .foregroundStyle(.secondary)
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
-        .background(
-            Capsule()
-                .fill(Color(nsColor: .controlBackgroundColor))
-        )
-        .overlay(
-            Capsule()
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
-        )
+        .pillBackground()
     }
 
     private var dotColor: Color {
@@ -1399,14 +1395,7 @@ private struct MetricPill: View {
         .foregroundStyle(.secondary)
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
-        .background(
-            Capsule()
-                .fill(Color(nsColor: .controlBackgroundColor))
-        )
-        .overlay(
-            Capsule()
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
-        )
+        .pillBackground()
         .help(detail)
     }
 }
@@ -1604,7 +1593,6 @@ private enum ToolGroup {
     case web
     case shell
     case localSearch
-    case other
 
     var icon: String {
         switch self {
@@ -1618,8 +1606,6 @@ private enum ToolGroup {
             return "terminal"
         case .localSearch:
             return "magnifyingglass"
-        case .other:
-            return "wrench.and.screwdriver"
         }
     }
 
@@ -1635,8 +1621,6 @@ private enum ToolGroup {
             return "Shell"
         case .localSearch:
             return "Search"
-        case .other:
-            return "Tool"
         }
     }
 
@@ -1652,8 +1636,6 @@ private enum ToolGroup {
             return .purple
         case .localSearch:
             return .orange
-        case .other:
-            return .secondary
         }
     }
 }
@@ -1661,9 +1643,7 @@ private enum ToolGroup {
 private struct AssistantMessageContent: View {
     let text: String
 
-    private var blocks: [AssistantBlock] {
-        AssistantMessageParser.blocks(from: text)
-    }
+    @State private var blocks: [AssistantBlock] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1676,6 +1656,8 @@ private struct AssistantMessageContent: View {
                 }
             }
         }
+        .onAppear { blocks = AssistantMessageParser.blocks(from: text) }
+        .onChange(of: text) { newValue in blocks = AssistantMessageParser.blocks(from: newValue) }
     }
 }
 
@@ -1756,9 +1738,7 @@ private enum AssistantMessageParser {
 private struct MarkdownContentView: View {
     let text: String
 
-    private var blocks: [MarkdownBlock] {
-        MarkdownParser.parse(text)
-    }
+    @State private var blocks: [MarkdownBlock] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1766,24 +1746,20 @@ private struct MarkdownContentView: View {
                 blockView(block)
             }
         }
+        .onAppear { blocks = MarkdownParser.parse(text) }
+        .onChange(of: text) { newValue in blocks = MarkdownParser.parse(newValue) }
     }
 
     @ViewBuilder
     private func blockView(_ block: MarkdownBlock) -> some View {
         switch block {
         case .paragraph(_, let text):
-            Text(text)
-                .font(.body)
-                .foregroundStyle(Color(nsColor: .labelColor))
-                .textSelection(.enabled)
-                .lineSpacing(4)
-                .fixedSize(horizontal: false, vertical: true)
+            proseText(text)
 
         case .heading(_, let level, let text):
             Text(text)
                 .font(headingFont(level))
-                .foregroundStyle(Color(nsColor: .labelColor))
-                .textSelection(.enabled)
+                .selectableLabel()
                 .fixedSize(horizontal: false, vertical: true)
 
         case .bulletList(_, let items):
@@ -1793,12 +1769,7 @@ private struct MarkdownContentView: View {
                         Text("•")
                             .font(.body)
                             .foregroundStyle(.secondary)
-                        Text(item)
-                            .font(.body)
-                            .foregroundStyle(Color(nsColor: .labelColor))
-                            .textSelection(.enabled)
-                            .lineSpacing(4)
-                            .fixedSize(horizontal: false, vertical: true)
+                        proseText(item)
                     }
                 }
             }
@@ -1810,12 +1781,7 @@ private struct MarkdownContentView: View {
                         Text("\(entry.number).")
                             .font(.body.monospacedDigit())
                             .foregroundStyle(.secondary)
-                        Text(entry.text)
-                            .font(.body)
-                            .foregroundStyle(Color(nsColor: .labelColor))
-                            .textSelection(.enabled)
-                            .lineSpacing(4)
-                            .fixedSize(horizontal: false, vertical: true)
+                        proseText(entry.text)
                     }
                 }
             }
@@ -1844,6 +1810,15 @@ private struct MarkdownContentView: View {
         }
     }
 
+    /// The standard prose-text styling shared by paragraphs and list items.
+    private func proseText(_ text: AttributedString) -> some View {
+        Text(text)
+            .font(.body)
+            .selectableLabel()
+            .lineSpacing(4)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
     private func headingFont(_ level: Int) -> Font {
         switch level {
         case 1: return .title2.weight(.semibold)
@@ -1869,19 +1844,11 @@ private struct MarkdownCodeBlockView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 Text(code)
                     .font(.system(.callout, design: .monospaced))
-                    .foregroundStyle(Color(nsColor: .labelColor))
-                    .textSelection(.enabled)
+                    .selectableLabel()
                     .padding(10)
             }
         }
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color(nsColor: .controlBackgroundColor))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
-        )
+        .cardBackground(cornerRadius: 8, fill: Color(nsColor: .controlBackgroundColor))
     }
 }
 
@@ -1901,8 +1868,7 @@ private struct MarkdownTableView: View {
                     ForEach(Array(header.enumerated()), id: \.offset) { column, cell in
                         Text(cell)
                             .font(.body.weight(.semibold))
-                            .foregroundStyle(Color(nsColor: .labelColor))
-                            .textSelection(.enabled)
+                            .selectableLabel()
                             .gridColumnAlignment(alignment(for: column))
                     }
                 }
@@ -1915,22 +1881,14 @@ private struct MarkdownTableView: View {
                         ForEach(Array(row.enumerated()), id: \.offset) { _, cell in
                             Text(cell)
                                 .font(.body)
-                                .foregroundStyle(Color(nsColor: .labelColor))
-                                .textSelection(.enabled)
+                                .selectableLabel()
                         }
                     }
                 }
             }
             .padding(12)
         }
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color(nsColor: .controlBackgroundColor))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
-        )
+        .cardBackground(cornerRadius: 8, fill: Color(nsColor: .controlBackgroundColor))
     }
 }
 
@@ -1991,14 +1949,7 @@ private struct ToolCallRow: View {
             Spacer(minLength: 0)
         }
         .padding(10)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color(nsColor: .controlBackgroundColor))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
-        )
+        .cardBackground(cornerRadius: 10, fill: Color(nsColor: .controlBackgroundColor))
         .frame(maxWidth: 620, alignment: .leading)
     }
 }
