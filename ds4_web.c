@@ -43,6 +43,7 @@ struct ds4_web {
     int port;
     pid_t chrome_pid;
     bool browser_allowed;
+    bool headless;
     ds4_web_confirm_fn confirm;
     void *confirm_privdata;
     ds4_web_log_fn log;
@@ -1020,6 +1021,13 @@ static const char *web_macos_chrome_app_name(void) {
 }
 #endif
 
+static bool web_headless_enabled(void) {
+    const char *env = getenv("DS4_WEB_HEADLESS");
+    if (!env || !env[0]) return true;
+    return strcmp(env, "0") != 0 && strcasecmp(env, "false") != 0 &&
+           strcasecmp(env, "no") != 0;
+}
+
 static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
     if (!web_mkdir_p(web->profile_dir)) {
         web_set_err(err, err_len, "failed to create Chrome profile dir %s: %s",
@@ -1029,7 +1037,8 @@ static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
     char *exe = web_chrome_executable();
 #ifdef __APPLE__
     const char *mac_app_name = web_macos_chrome_app_name();
-    bool launched_via_open = mac_app_name != NULL && access("/usr/bin/open", X_OK) == 0;
+    bool launched_via_open = mac_app_name != NULL &&
+                             access("/usr/bin/open", X_OK) == 0;
 #else
     bool launched_via_open = false;
 #endif
@@ -1051,6 +1060,14 @@ static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
         }
 #ifdef __APPLE__
         if (launched_via_open) {
+            if (web->headless) {
+                execlp("/usr/bin/open", "open", "-g", "-na", mac_app_name,
+                       "--args", port_arg, "--remote-allow-origins=*",
+                       profile_arg, "--headless=new", "--disable-gpu",
+                       "--no-first-run", "--no-default-browser-check",
+                       "--disable-sync", "--use-mock-keychain", "--password-store=basic",
+                       "--mute-audio", "about:blank", (char *)NULL);
+            }
             execlp("/usr/bin/open", "open", "-g", "-na", mac_app_name,
                    "--args", port_arg, "--remote-allow-origins=*",
                    profile_arg, "--no-first-run", "--no-default-browser-check",
@@ -1065,12 +1082,14 @@ static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
 #else
         if (geteuid() == 0) {
             execlp(exe, exe, port_arg, "--remote-allow-origins=*",
-                   profile_arg, "--no-first-run", "--no-default-browser-check",
+                   profile_arg, "--headless=new", "--disable-gpu",
+                   "--no-first-run", "--no-default-browser-check",
                    "--disable-sync", "--password-store=basic", "--no-sandbox",
                    "--mute-audio", "about:blank", (char *)NULL);
         } else {
             execlp(exe, exe, port_arg, "--remote-allow-origins=*",
-                   profile_arg, "--no-first-run", "--no-default-browser-check",
+                   profile_arg, "--headless=new", "--disable-gpu",
+                   "--no-first-run", "--no-default-browser-check",
                    "--disable-sync", "--password-store=basic",
                    "--mute-audio", "about:blank", (char *)NULL);
         }
@@ -1082,7 +1101,8 @@ static bool web_spawn_chrome(ds4_web *web, char *err, size_t err_len) {
     for (int i = 0; i < 80; i++) {
         if (web_set_cancel_err(web, err, err_len)) return false;
         if (web_cdp_alive(web)) {
-            web_log(web, "Chrome browser session is ready");
+            web_log(web, web->headless ? "Headless Chrome browser session is ready" :
+                    "Chrome browser session is ready");
             return true;
         }
         int status = 0;
@@ -1112,11 +1132,15 @@ static bool web_ensure_browser(ds4_web *web, char *err, size_t err_len) {
     if (!web->browser_allowed) {
         if (!web->confirm) {
             web_set_err(err, err_len,
-                        "starting a visible Chrome browser requires interactive approval");
+                        "starting a Chrome browser session requires interactive approval");
             return false;
         }
+        char approval_msg[160];
+        snprintf(approval_msg, sizeof(approval_msg),
+                 "The web tool wants to start a %sChrome browser session. Allow? (y/n) ",
+                 web->headless ? "headless " : "visible ");
         if (!web->confirm(web->confirm_privdata,
-                          "The web tool wants to start a visible Chrome browser. Allow? (y/n) ",
+                          approval_msg,
                           err, err_len))
         {
             if (err && !err[0]) web_set_err(err, err_len, "user denied Chrome browser start");
@@ -1144,6 +1168,28 @@ static char *web_browser_ws_url(ds4_web *web, char *err, size_t err_len) {
     return ws;
 }
 
+/* Ask Chrome to create a target and return its targetId, or NULL with err
+ * set to Chrome's own error message when available (falling back to a
+ * generic message when the response has neither a targetId nor an error
+ * message we can extract). */
+static char *web_create_target(cdp_ws *browser, const char *params_s,
+                               char *err, size_t err_len) {
+    char *resp = web_cdp_call(browser, "Target.createTarget", params_s, err, err_len);
+    if (!resp) return NULL;
+    char *target_id = web_json_get_string(resp, "targetId");
+    if (!target_id) {
+        char *message = web_json_get_string(resp, "message");
+        if (message) {
+            web_set_err(err, err_len, "Chrome refused to create a tab: %s", message);
+            free(message);
+        } else {
+            web_set_err(err, err_len, "Chrome did not return a page target id");
+        }
+    }
+    free(resp);
+    return target_id;
+}
+
 static bool web_open_tab(ds4_web *web, const char *url, web_tab *tab,
                          char *err, size_t err_len) {
     memset(tab, 0, sizeof(*tab));
@@ -1162,19 +1208,28 @@ static bool web_open_tab(ds4_web *web, const char *url, web_tab *tab,
     web_buf_puts(&params, "{\"url\":");
     web_buf_puts(&params, qurl);
     web_buf_puts(&params, ",\"background\":true,\"newWindow\":false}");
-    free(qurl);
     char *params_s = web_buf_take(&params);
-    char *resp = web_cdp_call(&browser, "Target.createTarget",
-                              params_s, err, err_len);
+    tab->id = web_create_target(&browser, params_s, err, err_len);
     free(params_s);
-    web_ws_close(&browser);
-    if (!resp) return false;
 
-    tab->id = web_json_get_string(resp, "targetId");
-    free(resp);
+    if (!tab->id) {
+        /* A Chrome instance left running from a previous session (ds4 keeps
+         * it alive across runs to avoid relaunch cost) may have no open
+         * window left to attach a background tab to. Fall back to opening
+         * a real window before giving up. */
+        web_buf params2 = {0};
+        web_buf_puts(&params2, "{\"url\":");
+        web_buf_puts(&params2, qurl);
+        web_buf_puts(&params2, ",\"newWindow\":true}");
+        char *params2_s = web_buf_take(&params2);
+        tab->id = web_create_target(&browser, params2_s, err, err_len);
+        free(params2_s);
+    }
+    free(qurl);
+    web_ws_close(&browser);
+
     if (!tab->id) {
         web_tab_free(tab);
-        web_set_err(err, err_len, "Chrome did not return a page target id");
         return false;
     }
 
@@ -1331,6 +1386,7 @@ ds4_web *ds4_web_create(const ds4_web_config *cfg) {
     snprintf(web->profile_dir, sizeof(web->profile_dir), "%s/.ds4/browser", home);
     web->port = cfg && cfg->port > 0 ? cfg->port : DS4_WEB_DEFAULT_PORT;
     web->chrome_pid = 0;
+    web->headless = web_headless_enabled();
     web->next_cdp_id = 1;
     if (cfg) {
         web->confirm = cfg->confirm;

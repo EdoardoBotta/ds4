@@ -40,17 +40,18 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm mac-app-bundle
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
 help:
 	@echo "DS4 build targets:"
-	@echo "  make              Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
-	@echo "  make cpu          Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
-	@echo "  make test         Build and run tests"
-	@echo "  make clean        Remove build outputs"
+	@echo "  make                  Build Metal ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
+	@echo "  make cpu              Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
+	@echo "  make mac-app-bundle   Build DS4MacApp.app for distribution"
+	@echo "  make test             Build and run tests"
+	@echo "  make clean            Remove build outputs"
 
 ds4: ds4_cli.o ds4_help.o linenoise.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_cli.o ds4_help.o linenoise.o $(CORE_OBJS) $(METAL_LDLIBS)
@@ -73,6 +74,21 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
+
+mac-app-bundle:
+	@echo "Building DS4MacApp release binary..."
+	cd mac-app && swift build -c release
+	@echo "Generating app icon..."
+	swift mac-app/make_icon.swift mac-app/AppIcon.iconset
+	iconutil -c icns mac-app/AppIcon.iconset -o mac-app/AppIcon.icns
+	rm -rf mac-app/AppIcon.iconset
+	@echo "Assembling DS4MacApp.app..."
+	rm -rf DS4MacApp.app
+	mkdir -p DS4MacApp.app/Contents/MacOS DS4MacApp.app/Contents/Resources
+	cp mac-app/.build/release/DS4MacApp DS4MacApp.app/Contents/MacOS/DS4MacApp
+	cp mac-app/Info.plist DS4MacApp.app/Contents/Info.plist
+	cp mac-app/AppIcon.icns DS4MacApp.app/Contents/Resources/AppIcon.icns
+	@echo "Done: DS4MacApp.app"
 
 cuda-regression:
 	@echo "cuda-regression requires a CUDA build"
@@ -241,4 +257,5 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o mac-app/AppIcon.icns
+	rm -rf DS4MacApp.app

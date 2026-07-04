@@ -25636,18 +25636,18 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                  load_output,
                  load_output_optional);
     if (e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
-        const uint64_t requested_cache_bytes = e->ssd_streaming_cache_bytes;
         const uint64_t safe_cache_bytes =
             ds4_streaming_manual_cache_safe_bytes();
         if (safe_cache_bytes != 0 &&
             e->ssd_streaming_cache_bytes > safe_cache_bytes) {
-            e->ssd_streaming_cache_bytes = safe_cache_bytes;
             fprintf(stderr,
-                    "ds4: %s SSD streaming cache budget %.2f GiB capped to %.2f GiB "
-                    "to keep expert buffers lockable\n",
+                    "ds4: %s SSD streaming cache budget %.2f GiB exceeds the %.2f GiB "
+                    "recommended safe threshold; non-routed weights, KV cache, scratch "
+                    "buffers, or macOS wired-memory overhead may force expert slots out "
+                    "of mlock during decode\n",
                     ds4_backend_name(e->backend),
-                    (double)requested_cache_bytes / 1073741824.0,
-                    (double)e->ssd_streaming_cache_bytes / 1073741824.0);
+                    (double)e->ssd_streaming_cache_bytes / 1073741824.0,
+                    (double)safe_cache_bytes / 1073741824.0);
         }
         uint64_t per_expert_bytes = 0;
         const uint32_t budget =

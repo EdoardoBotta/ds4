@@ -78,11 +78,16 @@ typedef enum {
     AGENT_WORKER_STOPPED,
 } agent_worker_state;
 
+typedef enum {
+    AGENT_PREFILL_USER_PROMPT = 0,
+    AGENT_PREFILL_TOOL_RESULTS = 1,
+} agent_prefill_kind;
+
 typedef struct {
     agent_worker_state state;
     int prefill_done;
     int prefill_total;
-    unsigned prefill_label;
+    agent_prefill_kind prefill_kind;
     double prefill_tps;
     int generated;
     double gen_tps;
@@ -148,7 +153,6 @@ typedef struct {
     bool raw_mode_needs_restore;
 } agent_worker;
 
-static unsigned agent_next_prefill_label(void);
 
 typedef struct agent_tail_capture {
     char *buf;
@@ -322,6 +326,7 @@ static void agent_publish_system_status(agent_worker *w, const char *msg);
 static int agent_web_confirm(void *privdata, const char *message,
                              char *err, size_t err_len);
 static void agent_web_log(void *privdata, const char *message);
+static void agent_noninteractive_web_approval_marker(const char *message);
 static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
                                      char *err, size_t err_len);
 static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
@@ -758,14 +763,14 @@ static const char agent_tools_prompt_edit_line[] =
 static const char agent_tools_prompt_after_edit[] =
     "For long-running bash commands, pass refresh_sec. If a bash job is still running, use "
     "bash_status to check it early or bash_stop to terminate it.\n\n"
-    "Use google_search to find web pages. Use visit_page to read a known URL with a visible browser. "
-    "The first web call may ask the user for permission to start Chrome.\n\n"
+    "Use google_search to find web pages. Use visit_page to read a known URL with a browser session. "
+    "The first web call may ask the user for permission to start Chrome; it runs headless by default.\n\n"
     "### Available Tool Schemas\n\n"
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
     "    \"name\": \"google_search\",\n"
-    "    \"description\": \"Search Google in a visible browser and return compact Markdown links.\",\n"
+    "    \"description\": \"Search Google in a browser session and return compact Markdown links.\",\n"
     "    \"parameters\": {\n"
     "      \"type\": \"object\",\n"
     "      \"properties\": {\n"
@@ -779,7 +784,7 @@ static const char agent_tools_prompt_after_edit[] =
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
     "    \"name\": \"visit_page\",\n"
-    "    \"description\": \"Open a URL in a visible browser and return rendered page Markdown.\",\n"
+    "    \"description\": \"Open a URL in a browser session and return rendered page Markdown.\",\n"
     "    \"parameters\": {\n"
     "      \"type\": \"object\",\n"
     "      \"properties\": {\n"
@@ -4033,9 +4038,9 @@ static void agent_publishf_system_status(agent_worker *w, const char *fmt, ...) 
 static int agent_web_confirm(void *privdata, const char *message,
                              char *err, size_t err_len) {
     agent_worker *w = privdata;
-    if (!w || w->cfg->non_interactive) {
+    if (!w || !w->cfg) {
         snprintf(err, err_len,
-                 "visible Chrome browser startup requires interactive approval");
+                 "Chrome browser startup requires interactive approval");
         return 0;
     }
 
@@ -4045,7 +4050,7 @@ static int agent_web_confirm(void *privdata, const char *message,
     w->web_approval_result = false;
     w->web_approval_error[0] = '\0';
     snprintf(w->web_approval_message, sizeof(w->web_approval_message),
-             "%s", message ? message : "Start visible Chrome browser? (y/n) ");
+             "%s", message ? message : "Start Chrome browser session? (y/n) ");
     agent_wake_locked(w);
     while (!w->stop && !w->interrupt && !w->web_approval_answered)
         pthread_cond_wait(&w->cond, &w->mu);
@@ -4069,6 +4074,21 @@ static void agent_web_log(void *privdata, const char *message) {
     agent_worker *w = privdata;
     if (!w || !message || !message[0]) return;
     agent_trace(w, "web: %s", message);
+}
+
+static void agent_noninteractive_web_approval_marker(const char *message) {
+    const char *prefix = "+DWARFSTAR_WEB_APPROVAL_REQUIRED ";
+    write_all(STDERR_FILENO, prefix, strlen(prefix));
+    if (message && message[0]) {
+        for (const char *p = message; *p; p++) {
+            char c = (*p == '\n' || *p == '\r') ? ' ' : *p;
+            write_all(STDERR_FILENO, &c, 1);
+        }
+    } else {
+        write_all(STDERR_FILENO, "Start Chrome browser session? (y/n) ",
+                  strlen("Start Chrome browser session? (y/n) "));
+    }
+    write_all(STDERR_FILENO, "\n", 1);
 }
 
 static bool agent_web_cancel(void *privdata) {
@@ -4156,14 +4176,12 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
 
     if (publish_progress) {
         pthread_mutex_lock(&w->mu);
-        unsigned prefill_label = w->status.state == AGENT_WORKER_PREFILL ?
-            w->status.prefill_label : agent_next_prefill_label();
         w->status.state = AGENT_WORKER_PREFILL;
         w->progress_base = cached;
         w->progress_started_at = now_sec();
         w->status.prefill_done = 0;
         w->status.prefill_total = suffix;
-        w->status.prefill_label = prefill_label;
+        w->status.prefill_kind = AGENT_PREFILL_USER_PROMPT;
         w->status.prefill_tps = 0.0;
         w->status.generated = 0;
         w->status.gen_tps = 0.0;
@@ -6487,7 +6505,7 @@ static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
  * Browser Web Tools
  * ============================================================================
  *
- * The browser subsystem lives in ds4_web.c: it owns visible Chrome and CDP.  The
+ * The browser subsystem lives in ds4_web.c: it owns Chrome and CDP.  The
  * agent side only asks for permission, dispatches tools, and caps visit_page
  * output using the same "head plus temp file" shape as bash.
  */
@@ -7707,14 +7725,13 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_trace_tokens(w, "prefill_suffix", prompt_for_sync, cached);
 
         pthread_mutex_lock(&w->mu);
-        unsigned prefill_label = w->status.state == AGENT_WORKER_PREFILL ?
-            w->status.prefill_label : agent_next_prefill_label();
         w->status.state = AGENT_WORKER_PREFILL;
         w->progress_base = cached;
         w->progress_started_at = now_sec();
         w->status.prefill_done = 0;
         w->status.prefill_total = suffix;
-        w->status.prefill_label = prefill_label;
+        w->status.prefill_kind = tool_round > 0 ?
+            AGENT_PREFILL_TOOL_RESULTS : AGENT_PREFILL_USER_PROMPT;
         w->status.prefill_tps = 0.0;
         w->status.generated = 0;
         w->status.gen_tps = 0.0;
@@ -8172,7 +8189,7 @@ static bool worker_submit(agent_worker *w, const char *text) {
         w->status.state = AGENT_WORKER_PREFILL;
         w->status.prefill_done = 0;
         w->status.prefill_total = 0;
-        w->status.prefill_label = agent_next_prefill_label();
+        w->status.prefill_kind = AGENT_PREFILL_USER_PROMPT;
         w->status.prefill_tps = 0.0;
         w->status.generated = 0;
         w->status.gen_tps = 0.0;
@@ -8363,24 +8380,10 @@ static void agent_power_status_suffix(const agent_status *st,
         buf[0] = '\0';
 }
 
-static unsigned agent_next_prefill_label(void) {
-    static unsigned next;
-    return next++;
-}
-
-/* Keep each prefill operation on a single playful label so the footer does not
- * visually churn while progress updates stream in. */
 static const char *agent_prefill_label(const agent_status *st) {
-    static const char *labels[] = {
-        "reading",
-        "absorbing",
-        "studying",
-        "gathering",
-        "crunching",
-        "scrutinizing",
-    };
-    size_t n = sizeof(labels) / sizeof(labels[0]);
-    return labels[(st ? st->prefill_label : 0u) % n];
+    if (st && st->prefill_kind == AGENT_PREFILL_TOOL_RESULTS)
+        return "reading tool results";
+    return "reading prompt";
 }
 
 /* Build the one-line footer shown below the prompt.  It is intentionally compact
@@ -9611,6 +9614,31 @@ static void agent_noninteractive_marker(const char *msg) {
     write_all(STDERR_FILENO, "\n", 1);
 }
 
+static void agent_noninteractive_prefill_marker(const agent_status *st) {
+    if (!st) return;
+    int done = st->prefill_done;
+    int total = st->prefill_total;
+    if (done < 0) done = 0;
+    if (total < 0) total = 0;
+    if (total > 0 && done > total) done = total;
+    const char *kind = st->prefill_kind == AGENT_PREFILL_TOOL_RESULTS ?
+        "tool_results" : "user_prompt";
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "+DWARFSTAR_PREFILL %d %d %.3f %s\n",
+                     done, total, st->prefill_tps, kind);
+    if (n > 0) write_all(STDERR_FILENO, buf, (size_t)n);
+}
+
+static void agent_noninteractive_context_marker(const agent_status *st) {
+    if (!st) return;
+    int used = st->ctx_used < 0 ? 0 : st->ctx_used;
+    int total = st->ctx_size < 0 ? 0 : st->ctx_size;
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "+DWARFSTAR_CONTEXT %d %d %.3f\n",
+                     used, total, st->gen_tps);
+    if (n > 0) write_all(STDERR_FILENO, buf, (size_t)n);
+}
+
 static int agent_read_stdin_available(agent_input_buf *in, bool *eof) {
     char buf[4096];
     for (;;) {
@@ -9628,6 +9656,59 @@ static int agent_read_stdin_available(agent_input_buf *in, bool *eof) {
         perror("ds4-agent: read stdin");
         return -1;
     }
+}
+
+static bool agent_input_take_web_approval(agent_input_buf *in, bool *allow) {
+    if (!in || !in->ptr || in->len == 0) return false;
+    char *nl = memchr(in->ptr, '\n', in->len);
+    if (!nl) return false;
+    size_t line_len = (size_t)(nl - in->ptr);
+    if (line_len > 0 && in->ptr[line_len - 1] == '\r') line_len--;
+
+    static const char prefix[] = "+DWARFSTAR_WEB_APPROVAL ";
+    size_t prefix_len = sizeof(prefix) - 1;
+    if (line_len < prefix_len ||
+        memcmp(in->ptr, prefix, prefix_len) != 0)
+        return false;
+
+    const char *answer = in->ptr + prefix_len;
+    size_t answer_len = line_len - prefix_len;
+    bool yes = (answer_len >= 3 && !strncasecmp(answer, "yes", 3)) ||
+               (answer_len >= 5 && !strncasecmp(answer, "allow", 5)) ||
+               (answer_len >= 1 && (answer[0] == 'y' || answer[0] == 'Y'));
+    bool no = (answer_len >= 2 && !strncasecmp(answer, "no", 2)) ||
+              (answer_len >= 4 && !strncasecmp(answer, "deny", 4)) ||
+              (answer_len >= 1 && (answer[0] == 'n' || answer[0] == 'N'));
+    if (!yes && !no) return false;
+
+    *allow = yes;
+    size_t consumed = (size_t)(nl - in->ptr) + 1;
+    memmove(in->ptr, in->ptr + consumed, in->len - consumed);
+    in->len -= consumed;
+    in->ptr[in->len] = '\0';
+    return true;
+}
+
+/* A front-end can ask the worker to abandon whatever it is currently doing
+ * (generating or running a tool) without tearing down the process, so the
+ * next prompt can reuse the already-loaded model and conversation state. */
+static bool agent_input_take_interrupt(agent_input_buf *in) {
+    if (!in || !in->ptr || in->len == 0) return false;
+    char *nl = memchr(in->ptr, '\n', in->len);
+    if (!nl) return false;
+    size_t line_len = (size_t)(nl - in->ptr);
+    if (line_len > 0 && in->ptr[line_len - 1] == '\r') line_len--;
+
+    static const char marker[] = "+DWARFSTAR_INTERRUPT";
+    size_t marker_len = sizeof(marker) - 1;
+    if (line_len != marker_len || memcmp(in->ptr, marker, marker_len) != 0)
+        return false;
+
+    size_t consumed = (size_t)(nl - in->ptr) + 1;
+    memmove(in->ptr, in->ptr + consumed, in->len - consumed);
+    in->len -= consumed;
+    in->ptr[in->len] = '\0';
+    return true;
 }
 
 /* Headless mode is intentionally just another front-end for the same worker.
@@ -9648,6 +9729,13 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     agent_input_buf input = {0};
     agent_prompt_queue queue = {0};
     double quiet_deadline = 0.0;
+    int last_prefill_done = -1;
+    int last_prefill_total = -1;
+    bool last_was_prefill = false;
+    int last_ctx_used = -1;
+    int last_ctx_size = -1;
+    int last_gen_tps_milli = -1;
+    bool web_approval_active = false;
     int rc = 0;
 
     if (!one_shot) {
@@ -9723,10 +9811,49 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             }
         }
 
+        bool web_allow = false;
+        if (!one_shot && agent_input_take_web_approval(&input, &web_allow)) {
+            worker_answer_web_approval(&worker, web_allow,
+                web_allow ? NULL : "user denied Chrome browser start");
+            web_approval_active = false;
+            waiting_announced = false;
+        }
+
+        if (!one_shot && agent_input_take_interrupt(&input)) {
+            worker_interrupt(&worker);
+            waiting_announced = false;
+        }
+
         char *out = NULL;
         size_t out_len = 0;
         agent_status st = {0};
         worker_consume(&worker, &out, &out_len, &st);
+        if (!one_shot) {
+            int gen_tps_milli = (int)(st.gen_tps * 1000.0 + 0.5);
+            if (st.ctx_used != last_ctx_used ||
+                st.ctx_size != last_ctx_size ||
+                gen_tps_milli != last_gen_tps_milli)
+            {
+                agent_noninteractive_context_marker(&st);
+                last_ctx_used = st.ctx_used;
+                last_ctx_size = st.ctx_size;
+                last_gen_tps_milli = gen_tps_milli;
+            }
+            if (st.state == AGENT_WORKER_PREFILL) {
+                if (st.prefill_done != last_prefill_done ||
+                    st.prefill_total != last_prefill_total) {
+                    agent_noninteractive_prefill_marker(&st);
+                    last_prefill_done = st.prefill_done;
+                    last_prefill_total = st.prefill_total;
+                }
+                last_was_prefill = true;
+            } else if (last_was_prefill) {
+                agent_noninteractive_marker("+DWARFSTAR_PREFILL_DONE");
+                last_was_prefill = false;
+                last_prefill_done = -1;
+                last_prefill_total = -1;
+            }
+        }
         if (out && out_len) {
             write_all(STDOUT_FILENO, out, out_len);
             fflush(stdout);
@@ -9736,6 +9863,15 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         if (worker_take_queued_user_drain_request(&worker)) {
             char *queued = agent_prompt_queue_take_all(&queue);
             worker_answer_queued_user_drain(&worker, queued);
+        }
+
+        char web_approval_msg[256];
+        if (!one_shot && !web_approval_active &&
+            worker_take_web_approval_request(&worker, web_approval_msg,
+                                             sizeof(web_approval_msg)))
+        {
+            agent_noninteractive_web_approval_marker(web_approval_msg);
+            web_approval_active = true;
         }
 
         if (st.state == AGENT_WORKER_ERROR) {
