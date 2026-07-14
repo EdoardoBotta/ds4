@@ -3562,6 +3562,7 @@ typedef struct {
     float    temperature;
     uint64_t seed;
     uint32_t mode;
+    uint32_t n_groups;
 } ds4_gpu_output_sample_args;
 
 typedef struct {
@@ -12982,6 +12983,17 @@ int ds4_gpu_matmul_q8_0_tensor(
     return ok;
 }
 
+static NSUInteger ds4_gpu_output_sample_group_limit(void) {
+    const char *value = getenv("DS4_METAL_OUTPUT_SAMPLE_GROUPS");
+    if (!value || !value[0]) return DS4_GPU_OUTPUT_SAMPLE_MAX_GROUPS;
+    char *end = NULL;
+    const unsigned long parsed = strtoul(value, &end, 10);
+    if (*end != '\0' || parsed == 0 || parsed > DS4_GPU_OUTPUT_SAMPLE_MAX_GROUPS) {
+        return DS4_GPU_OUTPUT_SAMPLE_MAX_GROUPS;
+    }
+    return (NSUInteger)parsed;
+}
+
 int ds4_gpu_output_sample_q8_0_tensor(
         ds4_gpu_tensor       *out_idx,
         const void           *model_map,
@@ -13004,9 +13016,12 @@ int ds4_gpu_output_sample_q8_0_tensor(
     @autoreleasepool {
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
         id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out_idx);
+        const uint64_t result_bytes = mode == 2u
+            ? sizeof(int32_t)
+            : DS4_GPU_OUTPUT_SAMPLE_RESULT_BYTES;
         if (!xbuf || !outbuf ||
             ds4_gpu_tensor_bytes(x) < (uint64_t)in_dim * sizeof(float) ||
-            ds4_gpu_tensor_bytes(out_idx) < sizeof(int32_t)) {
+            ds4_gpu_tensor_bytes(out_idx) < result_bytes) {
             fprintf(stderr, "ds4: Metal fused output sample received undersized activation buffers\n");
             return 0;
         }
@@ -13038,6 +13053,8 @@ int ds4_gpu_output_sample_q8_0_tensor(
         };
 
         const NSUInteger pair_count = ((NSUInteger)out_dim + 1u) / 2u;
+        const NSUInteger sample_groups = MIN(pair_count, ds4_gpu_output_sample_group_limit());
+        args.n_groups = (uint32_t)sample_groups;
         const NSUInteger project_smem = 2u * 32u * sizeof(float);
         const NSUInteger finish_threads = 256u;
 
@@ -13080,41 +13097,29 @@ int ds4_gpu_output_sample_q8_0_tensor(
                  threadsPerThreadgroup:MTLSizeMake(finish_threads, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
         } else {
-            id<MTLBuffer> partial_scores =
-                ds4_gpu_new_transient_buffer(pair_count * sizeof(float),
-                                             "ds4_fused_sample_partial_scores");
-            id<MTLBuffer> partial_ids =
-                ds4_gpu_new_transient_buffer(pair_count * sizeof(uint32_t),
-                                             "ds4_fused_sample_partial_ids");
-            if (!partial_scores || !partial_ids) return 0;
+            const uint32_t initial_winner[4] = {0u, (uint32_t)sample_groups, 0u, 0u};
+            memcpy((uint8_t *)[outbuf contents] + ds4_gpu_tensor_offset(out_idx),
+                   &initial_winner,
+                   sizeof(initial_winner));
             id<MTLComputePipelineState> project =
-                ds4_gpu_get_pipeline("kernel_dsv4_output_sample_reduce2_q8_0");
-            id<MTLComputePipelineState> finish =
-                ds4_gpu_get_pipeline("kernel_dsv4_output_sample_argmax");
-            if (!project || !finish) return 0;
+                ds4_gpu_get_pipeline("kernel_dsv4_output_sample_atomic_q8_0");
+            if (!project) return 0;
 
             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
             [enc setComputePipelineState:project];
             [enc setBytes:&args length:sizeof(args) atIndex:0];
             [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
             [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
-            [enc setBuffer:partial_scores offset:0 atIndex:3];
-            [enc setBuffer:partial_ids offset:0 atIndex:4];
-            [enc setThreadgroupMemoryLength:project_smem atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(pair_count, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
-            ds4_gpu_end_compute_encoder(cb, enc);
-
-            enc = ds4_gpu_compute_encoder(cb);
-            [enc setComputePipelineState:finish];
-            [enc setBytes:&args length:sizeof(args) atIndex:0];
-            [enc setBuffer:partial_scores offset:0 atIndex:1];
-            [enc setBuffer:partial_ids offset:0 atIndex:2];
             [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out_idx) atIndex:3];
-            [enc setThreadgroupMemoryLength:finish_threads * sizeof(float) atIndex:0];
-            [enc setThreadgroupMemoryLength:finish_threads * sizeof(uint32_t) atIndex:1];
-            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(finish_threads, 1, 1)];
+            [enc setBuffer:outbuf
+                  offset:ds4_gpu_tensor_offset(out_idx) + DS4_GPU_OUTPUT_SAMPLE_SCORES_OFFSET
+                 atIndex:4];
+            [enc setBuffer:outbuf
+                  offset:ds4_gpu_tensor_offset(out_idx) + DS4_GPU_OUTPUT_SAMPLE_IDS_OFFSET
+                 atIndex:5];
+            [enc setThreadgroupMemoryLength:project_smem atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(sample_groups, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
         }
 

@@ -234,6 +234,13 @@ int ds4_gpu_matmul_q8_0_tensor(
 /* Optional fused output sampler.  This is currently implemented only by the
  * Metal backend; callers must guard its use and keep the portable logits path
  * as fallback. */
+#define DS4_GPU_OUTPUT_SAMPLE_MAX_GROUPS 4096u
+#define DS4_GPU_OUTPUT_SAMPLE_HEADER_BYTES (4u * sizeof(uint32_t))
+#define DS4_GPU_OUTPUT_SAMPLE_SCORES_OFFSET DS4_GPU_OUTPUT_SAMPLE_HEADER_BYTES
+#define DS4_GPU_OUTPUT_SAMPLE_IDS_OFFSET \
+    (DS4_GPU_OUTPUT_SAMPLE_SCORES_OFFSET + DS4_GPU_OUTPUT_SAMPLE_MAX_GROUPS * sizeof(uint32_t))
+#define DS4_GPU_OUTPUT_SAMPLE_RESULT_BYTES \
+    (DS4_GPU_OUTPUT_SAMPLE_IDS_OFFSET + DS4_GPU_OUTPUT_SAMPLE_MAX_GROUPS * sizeof(uint32_t))
 int ds4_gpu_output_sample_q8_0_tensor(
         ds4_gpu_tensor       *out_idx,
         const void             *model_map,

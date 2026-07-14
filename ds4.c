@@ -11149,7 +11149,7 @@ static bool metal_graph_alloc_raw_cap(
     g->output_embd = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->output_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->logits = ds4_gpu_tensor_alloc(vocab_dim * sizeof(float));
-    g->sample_token = ds4_gpu_tensor_alloc(sizeof(int32_t));
+    g->sample_token = ds4_gpu_tensor_alloc(DS4_GPU_OUTPUT_SAMPLE_RESULT_BYTES);
     /*
      * MTP is deliberately outside the normal graph footprint.  A session that
      * does not opt in with --mtp must allocate and execute exactly the same
@@ -16077,6 +16077,44 @@ typedef struct {
     uint64_t seed;
 } metal_graph_output_sample_request;
 
+static bool metal_graph_read_output_sample(
+        const ds4_gpu_graph                    *g,
+        const metal_graph_output_sample_request *sample,
+        int                                    *token) {
+    if (!g || !g->sample_token || !sample || !token) return false;
+    if (sample->mode == 2u) {
+        return ds4_gpu_tensor_read(g->sample_token, 0, token, sizeof(*token)) != 0;
+    }
+
+    uint32_t header[4] = {0};
+    if (ds4_gpu_tensor_read(g->sample_token, 0, header, sizeof(header)) == 0 ||
+        header[1] == 0 || header[1] > DS4_GPU_OUTPUT_SAMPLE_MAX_GROUPS) {
+        return false;
+    }
+    uint32_t group_scores[DS4_GPU_OUTPUT_SAMPLE_MAX_GROUPS];
+    uint32_t group_ids[DS4_GPU_OUTPUT_SAMPLE_MAX_GROUPS];
+    const uint64_t group_bytes = (uint64_t)header[1] * sizeof(uint32_t);
+    if (ds4_gpu_tensor_read(g->sample_token,
+                            DS4_GPU_OUTPUT_SAMPLE_SCORES_OFFSET,
+                            group_scores,
+                            group_bytes) == 0 ||
+        ds4_gpu_tensor_read(g->sample_token,
+                            DS4_GPU_OUTPUT_SAMPLE_IDS_OFFSET,
+                            group_ids,
+                            group_bytes) == 0) {
+        return false;
+    }
+    uint32_t id = UINT32_MAX;
+    for (uint32_t group = 0; group < header[1]; group++) {
+        if (group_scores[group] == header[0] && group_ids[group] < id) {
+            id = group_ids[group];
+        }
+    }
+    if (id >= DS4_N_VOCAB) return false;
+    *token = (int)id;
+    return true;
+}
+
 /* Encode the final HC collapse, output norm, and vocab projection on Metal. */
 static bool metal_graph_encode_output_head(
         ds4_gpu_graph *g,
@@ -19430,7 +19468,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         if (ok) ok = ds4_gpu_end_commands() != 0;
         const double t_done = (profile || throttle) ? now_sec() : 0.0;
         if (ok && sample) {
-            ok = ds4_gpu_tensor_read(g->sample_token, 0, sample_token, sizeof(*sample_token)) != 0;
+            ok = metal_graph_read_output_sample(g, sample, sample_token);
         } else if (ok && logits) {
             ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
         }
@@ -19512,7 +19550,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     if (ok && output_needed) ok = ds4_gpu_end_commands() != 0;
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
     if (ok && sample) {
-        ok = ds4_gpu_tensor_read(g->sample_token, 0, sample_token, sizeof(*sample_token)) != 0;
+        ok = metal_graph_read_output_sample(g, sample, sample_token);
     } else if (ok && logits) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
@@ -19576,7 +19614,7 @@ static bool metal_graph_eval_token_raw_swa_ex(
         ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
     if (ok && sample) {
-        ok = ds4_gpu_tensor_read(g->sample_token, 0, sample_token, sizeof(*sample_token)) != 0;
+        ok = metal_graph_read_output_sample(g, sample, sample_token);
     }
     const double t_read = (profile || throttle) ? now_sec() : 0.0;
     if (profile) {
@@ -22707,6 +22745,42 @@ static uint64_t sample_rng_next(uint64_t *state) {
 static float sample_rng_f32(uint64_t *state) {
     const uint64_t x = sample_rng_next(state);
     return (float)((x >> 40) & 0xffffffu) / 16777216.0f;
+}
+
+static DS4_MAYBE_UNUSED uint64_t sample_gumbel_mix64(uint64_t x) {
+    x ^= x >> 30;
+    x *= UINT64_C(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x *= UINT64_C(0x94d049bb133111eb);
+    x ^= x >> 31;
+    return x;
+}
+
+static DS4_MAYBE_UNUSED float sample_gumbel(uint64_t seed, uint32_t id) {
+    const uint64_t x = sample_gumbel_mix64(
+        seed ^ ((uint64_t)id * UINT64_C(0x9e3779b97f4a7c15)));
+    float u = (float)((x >> 40) & 0xffffffu) * (1.0f / 16777216.0f);
+    u = fminf(fmaxf(u, 5.9604644775390625e-8f), 0.9999999403953552f);
+    return -logf(-logf(u));
+}
+
+static DS4_MAYBE_UNUSED int sample_gumbel_argmax(
+        const float *logits,
+        uint32_t n_vocab,
+        float temperature,
+        uint64_t seed) {
+    const float inv_t = 1.0f / fmaxf(temperature, 1.0e-20f);
+    float best = DS4_NEG_INF;
+    uint32_t best_id = UINT32_MAX;
+    for (uint32_t id = 0; id < n_vocab; id++) {
+        float score = logits[id] * inv_t + sample_gumbel(seed, id);
+        if (isnan(score)) score = DS4_NEG_INF;
+        if (score > best || (score == best && id < best_id)) {
+            best = score;
+            best_id = id;
+        }
+    }
+    return best_id == UINT32_MAX ? 0 : (int)best_id;
 }
 
 static bool ds4_env_binary_enabled(const char *name) {
@@ -27155,7 +27229,11 @@ int ds4_session_eval_sample_next(ds4_session *s,
                                                         NULL,
                                                         &req,
                                                         &fused_next);
-            if (ok && req.mode == 0 && ds4_env_binary_enabled("DS4_FUSED_SAMPLE_GREEDY_CHECK")) {
+            const bool check_greedy =
+                req.mode == 0 && ds4_env_binary_enabled("DS4_FUSED_SAMPLE_GREEDY_CHECK");
+            const bool check_full =
+                req.mode == 1 && ds4_env_binary_enabled("DS4_FUSED_SAMPLE_FULL_CHECK");
+            if (ok && (check_greedy || check_full)) {
                 ok = ds4_gpu_begin_commands() != 0;
                 if (ok) ok = metal_graph_encode_output_head(&s->graph,
                                                             &e->model,
@@ -27167,10 +27245,16 @@ int ds4_session_eval_sample_next(ds4_session *s,
                                                  s->logits,
                                                  (uint64_t)DS4_N_VOCAB * sizeof(s->logits[0])) != 0;
                 if (ok) {
-                    const int ref = sample_argmax(s->logits, DS4_N_VOCAB);
+                    const int ref = check_greedy
+                        ? sample_argmax(s->logits, DS4_N_VOCAB)
+                        : sample_gumbel_argmax(s->logits,
+                                               DS4_N_VOCAB,
+                                               req.temperature,
+                                               req.seed);
                     if (ref != fused_next) {
                         if (errlen) snprintf(err, errlen,
-                                             "fused greedy mismatch: fused=%d materialized=%d",
+                                             "fused %s mismatch: fused=%d materialized=%d",
+                                             check_greedy ? "greedy" : "full",
                                              fused_next,
                                              ref);
                         s->checkpoint_valid = false;
