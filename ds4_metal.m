@@ -3555,6 +3555,16 @@ typedef struct {
 } ds4_gpu_mul_mm_args;
 
 typedef struct {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t n_blocks;
+    uint32_t top_k;
+    float    temperature;
+    uint64_t seed;
+    uint32_t mode;
+} ds4_gpu_output_sample_args;
+
+typedef struct {
     int32_t  ne00;
     int32_t  ne01;
     int32_t  ne02;
@@ -12970,6 +12980,146 @@ int ds4_gpu_matmul_q8_0_tensor(
         }
     }
     return ok;
+}
+
+int ds4_gpu_output_sample_q8_0_tensor(
+        ds4_gpu_tensor       *out_idx,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        float                 temperature,
+        uint32_t              top_k,
+        uint64_t              seed,
+        uint32_t              mode) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out_idx || !x || in_dim == 0 || out_dim == 0 ||
+        (in_dim & 31u) != 0 || mode > 2u) {
+        return 0;
+    }
+    if (mode == 2u && (top_k == 0 || top_k > 1024u)) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out_idx);
+        if (!xbuf || !outbuf ||
+            ds4_gpu_tensor_bytes(x) < (uint64_t)in_dim * sizeof(float) ||
+            ds4_gpu_tensor_bytes(out_idx) < sizeof(int32_t)) {
+            fprintf(stderr, "ds4: Metal fused output sample received undersized activation buffers\n");
+            return 0;
+        }
+
+        const uint64_t blocks = (uint64_t)in_dim / 32u;
+        const uint64_t row_bytes = blocks * 34u;
+        const uint64_t weight_bytes = (uint64_t)out_dim * row_bytes;
+        if (weight_offset > model_size || weight_bytes > model_size - weight_offset) {
+            fprintf(stderr, "ds4: Metal fused output sample range is outside the mapped model\n");
+            return 0;
+        }
+
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map,
+                                                       model_size,
+                                                       weight_offset,
+                                                       weight_bytes,
+                                                       &inner_offset);
+        if (!wbuf) return 0;
+
+        ds4_gpu_output_sample_args args = {
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .n_blocks = (uint32_t)blocks,
+            .top_k = top_k,
+            .temperature = temperature,
+            .seed = seed,
+            .mode = mode,
+        };
+
+        const NSUInteger pair_count = ((NSUInteger)out_dim + 1u) / 2u;
+        const NSUInteger project_smem = 2u * 32u * sizeof(float);
+        const NSUInteger finish_threads = 256u;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        if (mode == 2u) {
+            id<MTLBuffer> scores = ds4_gpu_new_transient_buffer((NSUInteger)out_dim * sizeof(float),
+                                                                "ds4_fused_sample_scores");
+            if (!scores) return 0;
+            id<MTLComputePipelineState> project =
+                ds4_gpu_get_pipeline("kernel_dsv4_output_sample_scores2_q8_0");
+            id<MTLComputePipelineState> finish =
+                ds4_gpu_get_pipeline("kernel_dsv4_output_sample_topk");
+            if (!project || !finish) return 0;
+
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:project];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+            [enc setBuffer:scores offset:0 atIndex:3];
+            [enc setThreadgroupMemoryLength:project_smem atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(pair_count, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+
+            enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:finish];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:scores offset:0 atIndex:1];
+            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out_idx) atIndex:2];
+            const NSUInteger topk_count = MIN((NSUInteger)MIN(top_k, out_dim), (NSUInteger)1024u);
+            [enc setThreadgroupMemoryLength:finish_threads * sizeof(float) atIndex:0];
+            [enc setThreadgroupMemoryLength:finish_threads * sizeof(uint32_t) atIndex:1];
+            [enc setThreadgroupMemoryLength:topk_count * sizeof(float) atIndex:2];
+            [enc setThreadgroupMemoryLength:topk_count * sizeof(uint32_t) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(finish_threads, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        } else {
+            id<MTLBuffer> partial_scores =
+                ds4_gpu_new_transient_buffer(pair_count * sizeof(float),
+                                             "ds4_fused_sample_partial_scores");
+            id<MTLBuffer> partial_ids =
+                ds4_gpu_new_transient_buffer(pair_count * sizeof(uint32_t),
+                                             "ds4_fused_sample_partial_ids");
+            if (!partial_scores || !partial_ids) return 0;
+            id<MTLComputePipelineState> project =
+                ds4_gpu_get_pipeline("kernel_dsv4_output_sample_reduce2_q8_0");
+            id<MTLComputePipelineState> finish =
+                ds4_gpu_get_pipeline("kernel_dsv4_output_sample_argmax");
+            if (!project || !finish) return 0;
+
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:project];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+            [enc setBuffer:partial_scores offset:0 atIndex:3];
+            [enc setBuffer:partial_ids offset:0 atIndex:4];
+            [enc setThreadgroupMemoryLength:project_smem atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(pair_count, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+
+            enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:finish];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:partial_scores offset:0 atIndex:1];
+            [enc setBuffer:partial_ids offset:0 atIndex:2];
+            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out_idx) atIndex:3];
+            [enc setThreadgroupMemoryLength:finish_threads * sizeof(float) atIndex:0];
+            [enc setThreadgroupMemoryLength:finish_threads * sizeof(uint32_t) atIndex:1];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(finish_threads, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        }
+
+        return ds4_gpu_finish_command_buffer(cb, owned, "fused output sample");
+    }
 }
 
 int ds4_gpu_matmul_q8_0_pair_tensor(

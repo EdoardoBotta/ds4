@@ -347,7 +347,13 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--ctx-alloc N", "Allocated context. Default: ctx-max + gen-tokens + 1");
     opt(fp, c, "--step-mul F", "Multiplicative step. Default: 1");
     opt(fp, c, "--step-incr N", "Linear step when --step-mul is 1. Default: 2048");
-    opt(fp, c, "--gen-tokens N", "Greedy decode tokens per frontier. 0 for pure prefill. Default: 128");
+    opt(fp, c, "--gen-tokens N", "Decode tokens per frontier. 0 for pure prefill. Default: 128");
+    opt(fp, c, "--sample-mode MODE", "Generation probe: non-eos-greedy, greedy, full, or topk. Default: non-eos-greedy");
+    opt(fp, c, "--temperature F", "Sampling temperature for full/topk modes. Defaults to 1 there.");
+    opt(fp, c, "--top-k N", "Top-k for --sample-mode topk. Default: 64");
+    opt(fp, c, "--top-p F", "Sampling top-p for explicit sample modes. Full/topk force 0 for fused comparisons.");
+    opt(fp, c, "--min-p F", "Sampling min-p for explicit sample modes. Full/topk force 0 for fused comparisons.");
+    opt(fp, c, "--seed N", "Sampling RNG seed for explicit sample modes.");
     opt(fp, c, "--csv FILE", "Write CSV there instead of stdout.");
     opt(fp, c, "--dump-frontier-logits-dir DIR", "Write one full-logit JSON file per frontier.");
     fputc('\n', fp);
@@ -464,6 +470,7 @@ static void print_examples(FILE *fp, const help_colors *c, ds4_help_tool tool, c
     } else if (tool == DS4_HELP_BENCH || topic_is(topic, "benchmark")) {
         opt(fp, c, "csv", "./ds4-bench --prompt-file long.txt --ctx-max 32768 --csv speed.csv");
         opt(fp, c, "prefill only", "./ds4-bench --prompt-file long.txt --gen-tokens 0");
+        opt(fp, c, "sample", "DS4_FUSED_SAMPLE_TOPK=1 ./ds4-bench --prompt-file long.txt --sample-mode topk");
     } else if (tool == DS4_HELP_EVAL || topic_is(topic, "evaluation")) {
         opt(fp, c, "first 10", "./ds4-eval --questions 10 --trace eval.trace");
         opt(fp, c, "plain", "./ds4-eval --plain --nothink --tokens 512");

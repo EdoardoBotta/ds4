@@ -231,13 +231,27 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Optional fused output sampler.  This is currently implemented only by the
+ * Metal backend; callers must guard its use and keep the portable logits path
+ * as fallback. */
+int ds4_gpu_output_sample_q8_0_tensor(
+        ds4_gpu_tensor       *out_idx,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                in_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *x,
+        float                   temperature,
+        uint32_t                top_k,
+        uint64_t                seed,
+        uint32_t                mode);
+
 /* Optional fused GPU operations.
  *
- * These are acceleration hooks, not required backend primitives.  A backend
- * that does not provide the fused kernel must still define the symbol and
- * return 0.  Callers then use the portable sequence of required primitives.
- * Backends that return nonzero from a fused half-output operation must also
- * implement the matching half-input HC expansion helpers below.
+ * These are acceleration hooks, not required backend primitives.  Backends
+ * that return nonzero from a fused half-output operation must also implement
+ * the matching half-input HC expansion helpers below.
  */
 int ds4_gpu_matmul_q8_0_pair_tensor(
         ds4_gpu_tensor       *out0,

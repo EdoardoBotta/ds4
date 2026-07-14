@@ -10406,6 +10406,7 @@ typedef struct {
     ds4_gpu_tensor *output_embd;
     ds4_gpu_tensor *output_norm;
     ds4_gpu_tensor *logits;
+    ds4_gpu_tensor *sample_token;
 
     /* Optional MTP model state.  It has its own raw cache because the drafter
      * runs on speculative future tokens; target KV state is updated only after
@@ -10575,6 +10576,7 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->batch_next_hc);
     ds4_gpu_tensor_free(g->batch_cur_hc);
     ds4_gpu_tensor_free(g->prefill_tokens);
+    ds4_gpu_tensor_free(g->sample_token);
     ds4_gpu_tensor_free(g->logits);
     ds4_gpu_tensor_free(g->mtp_raw_cache);
     ds4_gpu_tensor_free(g->mtp_next_hc);
@@ -11147,6 +11149,7 @@ static bool metal_graph_alloc_raw_cap(
     g->output_embd = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->output_norm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     g->logits = ds4_gpu_tensor_alloc(vocab_dim * sizeof(float));
+    g->sample_token = ds4_gpu_tensor_alloc(sizeof(int32_t));
     /*
      * MTP is deliberately outside the normal graph footprint.  A session that
      * does not opt in with --mtp must allocate and execute exactly the same
@@ -11259,7 +11262,7 @@ static bool metal_graph_alloc_raw_cap(
                     g->routed_down && g->routed_out &&
                     g->after_ffn_hc &&
                     g->output_pre && g->output_weights && g->output_embd &&
-                    g->output_norm && g->logits &&
+                    g->output_norm && g->logits && g->sample_token &&
                     (!enable_mtp ||
                      (g->mtp_embed && g->mtp_enorm && g->mtp_eproj &&
                       g->mtp_eproj_hc && g->mtp_hnorm_hc && g->mtp_hproj_hc &&
@@ -16067,6 +16070,13 @@ static bool metal_graph_encode_decode_layer(
     return ok;
 }
 
+typedef struct {
+    uint32_t mode; /* 0 greedy, 1 full-vocab Gumbel-max, 2 top-k Gumbel-max */
+    float temperature;
+    uint32_t top_k;
+    uint64_t seed;
+} metal_graph_output_sample_request;
+
 /* Encode the final HC collapse, output norm, and vocab projection on Metal. */
 static bool metal_graph_encode_output_head(
         ds4_gpu_graph *g,
@@ -16126,6 +16136,63 @@ static bool metal_graph_encode_output_head(
     if (ok) {
         metal_graph_debug_dump_tensor("result_output", g->logits, vocab_dim, DS4_N_LAYER, 0);
     }
+    return ok;
+}
+
+static bool metal_graph_encode_output_sample(
+        ds4_gpu_graph                         *g,
+        const ds4_model                       *model,
+        const ds4_weights                     *weights,
+        uint64_t                               vocab_dim,
+        const metal_graph_output_sample_request *sample) {
+    if (!sample || !g || !model || !weights || !weights->output) return false;
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_gpu_matmul_f16_tensor(g->output_pre,
+                                             model->map,
+                                             model->size,
+                                             weights->output_hc_fn->abs_offset,
+                                             hc_dim,
+                                             DS4_N_HC,
+                                             g->flat_hc,
+                                             1) != 0;
+    if (ok) ok = ds4_gpu_output_hc_weights_tensor(g->output_weights,
+                                                    g->output_pre,
+                                                    model->map,
+                                                    model->size,
+                                                    weights->output_hc_scale->abs_offset,
+                                                    weights->output_hc_base->abs_offset,
+                                                    DS4_N_HC,
+                                                    DS4_HC_EPS) != 0;
+    if (ok) ok = ds4_gpu_hc_weighted_sum_tensor(g->output_embd,
+                                                  g->cur_hc,
+                                                  g->output_weights,
+                                                  DS4_N_EMBD,
+                                                  DS4_N_HC) != 0;
+    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
+                                                  g->output_embd,
+                                                  model->map,
+                                                  model->size,
+                                                  weights->output_norm->abs_offset,
+                                                  DS4_N_EMBD,
+                                                  DS4_RMS_EPS) != 0;
+#if defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (ok) ok = ds4_gpu_output_sample_q8_0_tensor(g->sample_token,
+                                                     model->map,
+                                                     model->size,
+                                                     weights->output->abs_offset,
+                                                     DS4_N_EMBD,
+                                                     (uint32_t)vocab_dim,
+                                                     g->output_norm,
+                                                     sample->temperature,
+                                                     sample->top_k,
+                                                     sample->seed,
+                                                     sample->mode) != 0;
+#else
+    (void)vocab_dim;
+    ok = false;
+#endif
     return ok;
 }
 
@@ -16950,6 +17017,7 @@ static bool metal_graph_encode_token_raw_swa(
         int                    token,
         uint32_t               pos,
         bool                   need_logits,
+        const metal_graph_output_sample_request *sample,
         bool                   allow_split_flush) {
     if (g->raw_cap == 0) {
         fprintf(stderr, "ds4: Metal graph raw KV cache is not allocated\n");
@@ -16995,7 +17063,9 @@ static bool metal_graph_encode_token_raw_swa(
         }
     }
 
-    if (ok && need_logits) {
+    if (ok && sample) {
+        ok = metal_graph_encode_output_sample(g, model, weights, weights->output->dim[1], sample);
+    } else if (ok && need_logits) {
         ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
     }
     return ok;
@@ -19289,11 +19359,14 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         const ds4_weights     *weights,
         int                    token,
         uint32_t               pos,
-        float                 *logits) {
+        float                 *logits,
+        const metal_graph_output_sample_request *sample,
+        int                   *sample_token) {
     if (g->raw_cap == 0) {
         fprintf(stderr, "ds4: Metal graph raw KV cache is not allocated\n");
         return false;
     }
+    if (sample && !sample_token) return false;
 
     const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
     const bool throttle = graph_power_throttle_enabled(g);
@@ -19348,25 +19421,29 @@ static bool metal_graph_eval_token_raw_swa_streaming(
                 g->after_ffn_hc = tmp;
             }
         }
-        if (ok && logits) {
+        if (ok && sample) {
+            ok = metal_graph_encode_output_sample(g, model, weights, weights->output->dim[1], sample);
+        } else if (ok && logits) {
             ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
         }
         const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
         const double t_done = (profile || throttle) ? now_sec() : 0.0;
-        if (ok && logits) {
+        if (ok && sample) {
+            ok = ds4_gpu_tensor_read(g->sample_token, 0, sample_token, sizeof(*sample_token)) != 0;
+        } else if (ok && logits) {
             ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
         }
         const double t_read = (profile || throttle) ? now_sec() : 0.0;
         if (profile) {
             fprintf(stderr,
-                    "ds4: metal SSD streaming batched token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
+                    "ds4: metal SSD streaming batched token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms output=%s\n",
                     pos,
                     (t_encoded - t0) * 1000.0,
                     (t_done - t_encoded) * 1000.0,
                     (t_read - t_done) * 1000.0,
                     (t_read - t0) * 1000.0,
-                    logits != NULL);
+                    sample ? "sample" : (logits ? "logits" : "none"));
         }
         if (ok && throttle) {
             graph_power_note_decode_token(g, t_read - t0);
@@ -19422,36 +19499,100 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         }
     }
 
-    if (ok && logits && !static_decode_map) ok = metal_graph_stream_map_output(model, weights);
+    const bool output_needed = logits != NULL || sample != NULL;
+    if (ok && output_needed && !static_decode_map) ok = metal_graph_stream_map_output(model, weights);
     const double t_head0 = profile ? now_sec() : 0.0;
-    if (ok && logits) ok = ds4_gpu_begin_commands() != 0;
-    if (ok && logits) ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+    if (ok && output_needed) ok = ds4_gpu_begin_commands() != 0;
+    if (ok && sample) {
+        ok = metal_graph_encode_output_sample(g, model, weights, weights->output->dim[1], sample);
+    } else if (ok && logits) {
+        ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+    }
     const double t_head_encoded = profile ? now_sec() : 0.0;
-    if (ok && logits) ok = ds4_gpu_end_commands() != 0;
+    if (ok && output_needed) ok = ds4_gpu_end_commands() != 0;
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
-    if (ok && logits) {
+    if (ok && sample) {
+        ok = ds4_gpu_tensor_read(g->sample_token, 0, sample_token, sizeof(*sample_token)) != 0;
+    } else if (ok && logits) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
     const double t_read = (profile || throttle) ? now_sec() : 0.0;
 
     if (profile) {
-        if (logits) {
+        if (output_needed) {
             encode_s += t_head_encoded - t_head0;
             execute_s += t_done - t_head_encoded;
         }
         fprintf(stderr,
-                "ds4: metal SSD streaming token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
+                "ds4: metal SSD streaming token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms output=%s\n",
                 pos,
                 encode_s * 1000.0,
                 execute_s * 1000.0,
                 (t_read - t_done) * 1000.0,
                 (t_read - t0) * 1000.0,
-                logits != NULL);
+                sample ? "sample" : (logits ? "logits" : "none"));
     }
     if (ok) graph_power_note_decode_token(g, t_read - t0);
     if (!ok) {
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: Metal synchronize after SSD streaming graph eval failure also failed\n");
+        }
+    }
+    return ok;
+}
+
+static bool metal_graph_eval_token_raw_swa_ex(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        int                    token,
+        uint32_t               pos,
+        float                 *logits,
+        const metal_graph_output_sample_request *sample,
+        int                   *sample_token) {
+    if (sample && (!sample_token || !g)) return false;
+    if (g && g->ssd_streaming) {
+        return metal_graph_eval_token_raw_swa_streaming(g, model, weights, token, pos, logits, sample, sample_token);
+    }
+
+    const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
+    const bool throttle = graph_power_throttle_enabled(g);
+    const double t0 = (profile || throttle) ? now_sec() : 0.0;
+
+    bool ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = metal_graph_encode_token_raw_swa(g,
+                                                  model,
+                                                  weights,
+                                                  token,
+                                                  pos,
+                                                  logits != NULL,
+                                                  sample,
+                                                  true);
+    const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    const double t_done = (profile || throttle) ? now_sec() : 0.0;
+
+    if (ok && logits) {
+        ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    if (ok && sample) {
+        ok = ds4_gpu_tensor_read(g->sample_token, 0, sample_token, sizeof(*sample_token)) != 0;
+    }
+    const double t_read = (profile || throttle) ? now_sec() : 0.0;
+    if (profile) {
+        fprintf(stderr,
+                "ds4: metal graph token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms output=%s\n",
+                pos,
+                (t_encoded - t0) * 1000.0,
+                (t_done - t_encoded) * 1000.0,
+                (t_read - t_done) * 1000.0,
+                (t_read - t0) * 1000.0,
+                sample ? "sample" : (logits ? "logits" : "none"));
+    }
+    if (ok) graph_power_note_decode_token(g, t_read - t0);
+    if (!ok) {
+        if (ds4_gpu_synchronize() == 0) {
+            fprintf(stderr, "ds4: Metal synchronize after graph eval failure also failed\n");
         }
     }
     return ok;
@@ -19465,41 +19606,7 @@ static bool metal_graph_eval_token_raw_swa(
         int                    token,
         uint32_t               pos,
         float                 *logits) {
-    if (g && g->ssd_streaming) {
-        return metal_graph_eval_token_raw_swa_streaming(g, model, weights, token, pos, logits);
-    }
-
-    const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
-    const bool throttle = graph_power_throttle_enabled(g);
-    const double t0 = (profile || throttle) ? now_sec() : 0.0;
-
-    bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
-    const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    const double t_done = (profile || throttle) ? now_sec() : 0.0;
-
-    if (ok && logits) {
-        ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
-    }
-    const double t_read = (profile || throttle) ? now_sec() : 0.0;
-    if (profile) {
-        fprintf(stderr,
-                "ds4: metal graph token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
-                pos,
-                (t_encoded - t0) * 1000.0,
-                (t_done - t_encoded) * 1000.0,
-                (t_read - t_done) * 1000.0,
-                (t_read - t0) * 1000.0,
-                logits != NULL);
-    }
-    if (ok) graph_power_note_decode_token(g, t_read - t0);
-    if (!ok) {
-        if (ds4_gpu_synchronize() == 0) {
-            fprintf(stderr, "ds4: Metal synchronize after graph eval failure also failed\n");
-        }
-    }
-    return ok;
+    return metal_graph_eval_token_raw_swa_ex(g, model, weights, token, pos, logits, NULL, NULL);
 }
 
 static bool metal_graph_streaming_decode_prefill_wide_default(
@@ -19902,7 +20009,7 @@ static bool metal_graph_eval_token_raw_swa_top(
 
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights,
-                                                  token, pos, true, true);
+                                                  token, pos, true, NULL, true);
     if (ok) {
         ok = ds4_gpu_argmax_tensor(g->comp_selected,
                                    g->logits,
@@ -22600,6 +22707,11 @@ static uint64_t sample_rng_next(uint64_t *state) {
 static float sample_rng_f32(uint64_t *state) {
     const uint64_t x = sample_rng_next(state);
     return (float)((x >> 40) & 0xffffffu) / 16777216.0f;
+}
+
+static bool ds4_env_binary_enabled(const char *name) {
+    const char *v = getenv(name);
+    return v && v[0] && strcmp(v, "0") != 0;
 }
 
 typedef struct {
@@ -26989,6 +27101,100 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p, rng);
+}
+
+static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
+                                     char *err, size_t errlen);
+
+int ds4_session_eval_sample_next(ds4_session *s,
+                                 int token,
+                                 float temperature,
+                                 int top_k,
+                                 float top_p,
+                                 float min_p,
+                                 uint64_t *rng,
+                                 int *next_token,
+                                 char *err,
+                                 size_t errlen) {
+    if (!s || !next_token) {
+        if (errlen) snprintf(err, errlen, "invalid sample-next request");
+        return 1;
+    }
+
+#ifndef DS4_NO_GPU
+    ds4_engine *e = s->engine;
+    if (e && e->backend == DS4_BACKEND_METAL && !s->distributed && !ds4_session_is_cpu(s) &&
+        weights_have_output_head(&e->weights)) {
+        metal_graph_output_sample_request req = {0};
+        bool use_fused = false;
+        uint64_t rng_saved = rng ? *rng : 0;
+        if (temperature <= 0.0f) {
+            use_fused = ds4_env_binary_enabled("DS4_FUSED_SAMPLE_GREEDY");
+            req.mode = 0;
+            req.temperature = 1.0f;
+        } else if (top_k > 0 && min_p == 0.0f && (top_p <= 0.0f || top_p >= 1.0f)) {
+            use_fused = ds4_env_binary_enabled("DS4_FUSED_SAMPLE_TOPK") && rng != NULL;
+            req.mode = 2;
+            req.temperature = temperature;
+            req.top_k = (uint32_t)(top_k > 1024 ? 1024 : top_k);
+            req.seed = use_fused ? sample_rng_next(rng) : 0;
+        } else if (top_k <= 0 && top_p <= 0.0f && min_p == 0.0f) {
+            use_fused = ds4_env_binary_enabled("DS4_FUSED_SAMPLE_FULL") && rng != NULL;
+            req.mode = 1;
+            req.temperature = temperature;
+            req.seed = use_fused ? sample_rng_next(rng) : 0;
+        }
+
+        if (use_fused) {
+            int fused_next = -1;
+            bool ok = metal_graph_eval_token_raw_swa_ex(&s->graph,
+                                                        &e->model,
+                                                        &e->weights,
+                                                        token,
+                                                        (uint32_t)s->checkpoint.len,
+                                                        NULL,
+                                                        &req,
+                                                        &fused_next);
+            if (ok && req.mode == 0 && ds4_env_binary_enabled("DS4_FUSED_SAMPLE_GREEDY_CHECK")) {
+                ok = ds4_gpu_begin_commands() != 0;
+                if (ok) ok = metal_graph_encode_output_head(&s->graph,
+                                                            &e->model,
+                                                            &e->weights,
+                                                            e->weights.output->dim[1]);
+                if (ok) ok = ds4_gpu_end_commands() != 0;
+                if (ok) ok = ds4_gpu_tensor_read(s->graph.logits,
+                                                 0,
+                                                 s->logits,
+                                                 (uint64_t)DS4_N_VOCAB * sizeof(s->logits[0])) != 0;
+                if (ok) {
+                    const int ref = sample_argmax(s->logits, DS4_N_VOCAB);
+                    if (ref != fused_next) {
+                        if (errlen) snprintf(err, errlen,
+                                             "fused greedy mismatch: fused=%d materialized=%d",
+                                             fused_next,
+                                             ref);
+                        s->checkpoint_valid = false;
+                        return 1;
+                    }
+                }
+            }
+            if (ok) {
+                token_vec_push(&s->checkpoint, token);
+                s->checkpoint_valid = true;
+                s->mtp_draft_valid = false;
+                *next_token = fused_next;
+                return 0;
+            }
+            if (rng) *rng = rng_saved;
+        }
+    }
+#endif
+
+    if (ds4_session_eval_internal(s, token, false, err, errlen) != 0) {
+        return 1;
+    }
+    *next_token = ds4_session_sample(s, temperature, top_k, top_p, min_p, rng);
+    return 0;
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {

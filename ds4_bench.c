@@ -49,6 +49,12 @@ typedef struct {
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
+    const char *sample_mode;
+    float temperature;
+    float top_p;
+    float min_p;
+    int top_k;
+    uint64_t seed;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -79,6 +85,26 @@ static int parse_nonnegative_int(const char *s, const char *opt) {
         exit(2);
     }
     return (int)v;
+}
+
+static float parse_float_arg(const char *s, const char *opt) {
+    char *end = NULL;
+    float v = strtof(s, &end);
+    if (s[0] == '\0' || *end != '\0' || !isfinite(v)) {
+        fprintf(stderr, "ds4-bench: invalid value for %s: %s\n", opt, s);
+        exit(2);
+    }
+    return v;
+}
+
+static uint64_t parse_u64_arg(const char *s, const char *opt) {
+    char *end = NULL;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (s[0] == '\0' || *end != '\0') {
+        fprintf(stderr, "ds4-bench: invalid value for %s: %s\n", opt, s);
+        exit(2);
+    }
+    return (uint64_t)v;
 }
 
 static double parse_double_arg(const char *s, const char *opt) {
@@ -175,6 +201,11 @@ static bench_config parse_options(int argc, char **argv) {
         .step_incr = 2048,
         .gen_tokens = 128,
         .step_mul = 1.0,
+        .sample_mode = "non-eos-greedy",
+        .temperature = 0.0f,
+        .top_p = 1.0f,
+        .min_p = 0.0f,
+        .seed = 0x123456789abcdef0ULL,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -226,6 +257,18 @@ static bench_config parse_options(int argc, char **argv) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--sample-mode")) {
+            c.sample_mode = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--temperature")) {
+            c.temperature = parse_float_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--top-k")) {
+            c.top_k = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--top-p")) {
+            c.top_p = parse_float_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--min-p")) {
+            c.min_p = parse_float_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--seed")) {
+            c.seed = parse_u64_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--expert-profile")) {
             c.expert_profile_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
@@ -315,6 +358,29 @@ static bench_config parse_options(int argc, char **argv) {
     if (c.ctx_alloc <= c.ctx_max + c.gen_tokens) {
         fprintf(stderr, "ds4-bench: --ctx-alloc must be greater than ctx-max + gen-tokens\n");
         exit(2);
+    }
+    if (strcmp(c.sample_mode, "non-eos-greedy") &&
+        strcmp(c.sample_mode, "greedy") &&
+        strcmp(c.sample_mode, "full") &&
+        strcmp(c.sample_mode, "topk")) {
+        fprintf(stderr, "ds4-bench: --sample-mode must be non-eos-greedy, greedy, full, or topk\n");
+        exit(2);
+    }
+    if (!strcmp(c.sample_mode, "greedy")) {
+        c.temperature = 0.0f;
+        c.top_k = 0;
+        c.top_p = 1.0f;
+        c.min_p = 0.0f;
+    } else if (!strcmp(c.sample_mode, "full")) {
+        if (c.temperature <= 0.0f) c.temperature = 1.0f;
+        c.top_k = 0;
+        c.top_p = 0.0f;
+        c.min_p = 0.0f;
+    } else if (!strcmp(c.sample_mode, "topk")) {
+        if (c.temperature <= 0.0f) c.temperature = 1.0f;
+        if (c.top_k <= 0) c.top_k = 64;
+        c.top_p = 0.0f;
+        c.min_p = 0.0f;
     }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.dist, NULL, dist_err, sizeof(dist_err)) != 0) {
@@ -622,22 +688,55 @@ int main(int argc, char **argv) {
         }
 
         const double gen_t0 = bench_now_sec();
-        for (int i = 0; i < cfg.gen_tokens; i++) {
-            if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
-                fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
-                rc = 1;
-                break;
+        if (!strcmp(cfg.sample_mode, "non-eos-greedy")) {
+            for (int i = 0; i < cfg.gen_tokens; i++) {
+                if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
+                    fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
+                    rc = 1;
+                    break;
+                }
+                const int token = ds4_session_argmax_excluding(session, eos);
+                if (token < 0) {
+                    fprintf(stderr, "ds4-bench: failed to choose non-EOS token at frontier %d\n", frontier);
+                    rc = 1;
+                    break;
+                }
+                if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+                    fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
             }
-            const int token = ds4_session_argmax_excluding(session, eos);
-            if (token < 0) {
-                fprintf(stderr, "ds4-bench: failed to choose non-EOS token at frontier %d\n", frontier);
-                rc = 1;
-                break;
-            }
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
-                rc = 1;
-                break;
+        } else {
+            uint64_t rng = cfg.seed ^ ((uint64_t)(uint32_t)frontier * UINT64_C(0x9e3779b97f4a7c15));
+            int token = ds4_session_sample(session,
+                                           cfg.temperature,
+                                           cfg.top_k,
+                                           cfg.top_p,
+                                           cfg.min_p,
+                                           &rng);
+            for (int i = 0; i < cfg.gen_tokens; i++) {
+                if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
+                    fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
+                    rc = 1;
+                    break;
+                }
+                int next = -1;
+                if (ds4_session_eval_sample_next(session,
+                                                 token,
+                                                 cfg.temperature,
+                                                 cfg.top_k,
+                                                 cfg.top_p,
+                                                 cfg.min_p,
+                                                 &rng,
+                                                 &next,
+                                                 err,
+                                                 sizeof(err)) != 0) {
+                    fprintf(stderr, "ds4-bench: decode/sample at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                token = next;
             }
         }
         const double gen_t1 = bench_now_sec();

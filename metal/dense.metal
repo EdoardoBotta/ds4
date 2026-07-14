@@ -190,6 +190,326 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+struct ds4_metal_args_output_sample {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t n_blocks;
+    uint32_t top_k;
+    float    temperature;
+    uint64_t seed;
+    uint32_t mode;
+};
+
+static inline uint64_t ds4_output_sample_mix64(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ul;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebul;
+    x ^= x >> 31;
+    return x;
+}
+
+static inline float ds4_output_sample_gumbel(uint64_t seed, uint32_t id) {
+    const uint64_t x = ds4_output_sample_mix64(seed ^ ((uint64_t)id * 0x9e3779b97f4a7c15ul));
+    float u = (float)((x >> 40) & 0xffffffu) * (1.0f / 16777216.0f);
+    u = clamp(u, 5.9604644775390625e-8f, 0.9999999403953552f);
+    return -log(-log(u));
+}
+
+static inline bool ds4_output_sample_better(float av, uint32_t ai, float bv, uint32_t bi) {
+    return av > bv || (av == bv && ai < bi);
+}
+
+// Computes two Q8_0 output rows per threadgroup and emits only the better row
+// for greedy or full-vocab Gumbel-max sampling.
+kernel void kernel_dsv4_output_sample_reduce2_q8_0(
+        constant ds4_metal_args_output_sample &args,
+        device const char  *weight,
+        device const float *x,
+        device float       *partial_scores,
+        device uint32_t    *partial_ids,
+        threadgroup char   *shmem [[threadgroup(0)]],
+        uint pair [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+    constexpr short NSG = N_SG_Q8_0;
+    const uint32_t row0 = pair * 2u;
+    const uint32_t row1 = row0 + 1u;
+    const uint64_t row_bytes = (uint64_t)args.n_blocks * sizeof(block_q8_0);
+    device const block_q8_0 *w0 = row0 < args.out_dim
+        ? (device const block_q8_0 *)(weight + (uint64_t)row0 * row_bytes)
+        : (device const block_q8_0 *)weight;
+    device const block_q8_0 *w1 = row1 < args.out_dim
+        ? (device const block_q8_0 *)(weight + (uint64_t)row1 * row_bytes)
+        : (device const block_q8_0 *)weight;
+
+    float sumf[2] = {0.0f, 0.0f};
+    const short ix = tiisg / (NW / NQ);
+    const short il = tiisg % (NW / NQ);
+    const int ib0 = sgitg * NQ + ix;
+    device const float *yb = x + (uint64_t)ib0 * QK8_0 + il * NQ;
+    for (uint32_t ib = ib0; ib < args.n_blocks; ib += NSG * NQ) {
+        float yl[NQ];
+        for (short i = 0; i < NQ; i++) yl[i] = yb[i];
+        if (row0 < args.out_dim) {
+            device const int8_t *qs = w0[ib].qs + il * NQ;
+            float sumq = 0.0f;
+            for (short i = 0; i < NQ; i++) sumq += qs[i] * yl[i];
+            sumf[0] += sumq * (float)w0[ib].d;
+        }
+        if (row1 < args.out_dim) {
+            device const int8_t *qs = w1[ib].qs + il * NQ;
+            float sumq = 0.0f;
+            for (short i = 0; i < NQ; i++) sumq += qs[i] * yl[i];
+            sumf[1] += sumq * (float)w1[ib].d;
+        }
+        yb += NSG * NQ * QK8_0;
+    }
+
+    threadgroup float *s0 = (threadgroup float *)shmem;
+    threadgroup float *s1 = s0 + NW;
+    if (sgitg == 0) {
+        s0[tiisg] = 0.0f;
+        s1[tiisg] = 0.0f;
+    }
+    sumf[0] = simd_sum(sumf[0]);
+    sumf[1] = simd_sum(sumf[1]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        s0[sgitg] = sumf[0];
+        s1[sgitg] = sumf[1];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float v0 = simd_sum(s0[tiisg]);
+    float v1 = simd_sum(s1[tiisg]);
+    if (tiisg == 0 && sgitg == 0) {
+        if (args.mode == 1u) {
+            const float inv_t = 1.0f / max(args.temperature, 1.0e-20f);
+            v0 = v0 * inv_t + ds4_output_sample_gumbel(args.seed, row0);
+            v1 = row1 < args.out_dim
+                ? v1 * inv_t + ds4_output_sample_gumbel(args.seed, row1)
+                : -INFINITY;
+        }
+        if (row1 < args.out_dim && ds4_output_sample_better(v1, row1, v0, row0)) {
+            partial_scores[pair] = v1;
+            partial_ids[pair] = row1;
+        } else {
+            partial_scores[pair] = v0;
+            partial_ids[pair] = row0;
+        }
+    }
+}
+
+// Computes two Q8_0 output rows per threadgroup and writes raw logits for the
+// top-k reducer. This is still private scratch, not the public logits tensor.
+kernel void kernel_dsv4_output_sample_scores2_q8_0(
+        constant ds4_metal_args_output_sample &args,
+        device const char  *weight,
+        device const float *x,
+        device float       *scores,
+        threadgroup char   *shmem [[threadgroup(0)]],
+        uint pair [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+    constexpr short NSG = N_SG_Q8_0;
+    const uint32_t row0 = pair * 2u;
+    const uint32_t row1 = row0 + 1u;
+    const uint64_t row_bytes = (uint64_t)args.n_blocks * sizeof(block_q8_0);
+    device const block_q8_0 *w0 = row0 < args.out_dim
+        ? (device const block_q8_0 *)(weight + (uint64_t)row0 * row_bytes)
+        : (device const block_q8_0 *)weight;
+    device const block_q8_0 *w1 = row1 < args.out_dim
+        ? (device const block_q8_0 *)(weight + (uint64_t)row1 * row_bytes)
+        : (device const block_q8_0 *)weight;
+
+    float sumf[2] = {0.0f, 0.0f};
+    const short ix = tiisg / (NW / NQ);
+    const short il = tiisg % (NW / NQ);
+    const int ib0 = sgitg * NQ + ix;
+    device const float *yb = x + (uint64_t)ib0 * QK8_0 + il * NQ;
+    for (uint32_t ib = ib0; ib < args.n_blocks; ib += NSG * NQ) {
+        float yl[NQ];
+        for (short i = 0; i < NQ; i++) yl[i] = yb[i];
+        if (row0 < args.out_dim) {
+            device const int8_t *qs = w0[ib].qs + il * NQ;
+            float sumq = 0.0f;
+            for (short i = 0; i < NQ; i++) sumq += qs[i] * yl[i];
+            sumf[0] += sumq * (float)w0[ib].d;
+        }
+        if (row1 < args.out_dim) {
+            device const int8_t *qs = w1[ib].qs + il * NQ;
+            float sumq = 0.0f;
+            for (short i = 0; i < NQ; i++) sumq += qs[i] * yl[i];
+            sumf[1] += sumq * (float)w1[ib].d;
+        }
+        yb += NSG * NQ * QK8_0;
+    }
+
+    threadgroup float *s0 = (threadgroup float *)shmem;
+    threadgroup float *s1 = s0 + NW;
+    if (sgitg == 0) {
+        s0[tiisg] = 0.0f;
+        s1[tiisg] = 0.0f;
+    }
+    sumf[0] = simd_sum(sumf[0]);
+    sumf[1] = simd_sum(sumf[1]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        s0[sgitg] = sumf[0];
+        s1[sgitg] = sumf[1];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float v0 = simd_sum(s0[tiisg]);
+    float v1 = simd_sum(s1[tiisg]);
+    if (tiisg == 0 && sgitg == 0) {
+        if (row0 < args.out_dim) scores[row0] = v0;
+        if (row1 < args.out_dim) scores[row1] = v1;
+    }
+}
+
+kernel void kernel_dsv4_output_sample_argmax(
+        constant ds4_metal_args_output_sample &args,
+        device const float    *scores,
+        device const uint32_t *ids,
+        device int32_t        *out_idx,
+        threadgroup float     *score_mem [[threadgroup(0)]],
+        threadgroup uint32_t  *id_mem [[threadgroup(1)]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint ntg [[threads_per_threadgroup]]) {
+    const uint32_t n = (args.out_dim + 1u) >> 1;
+    float best = -INFINITY;
+    uint32_t best_id = 0u;
+    for (uint32_t i = tid; i < n; i += ntg) {
+        const float v = scores[i];
+        const uint32_t id = ids[i];
+        if (ds4_output_sample_better(v, id, best, best_id)) {
+            best = v;
+            best_id = id;
+        }
+    }
+
+    score_mem[tid] = best;
+    id_mem[tid] = best_id;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride &&
+            ds4_output_sample_better(score_mem[tid + stride],
+                                     id_mem[tid + stride],
+                                     score_mem[tid],
+                                     id_mem[tid])) {
+            score_mem[tid] = score_mem[tid + stride];
+            id_mem[tid] = id_mem[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) out_idx[0] = (int32_t)id_mem[0];
+}
+
+kernel void kernel_dsv4_output_sample_topk(
+        constant ds4_metal_args_output_sample &args,
+        device const float *scores,
+        device int32_t     *out_idx,
+        threadgroup float    *score_mem [[threadgroup(0)]],
+        threadgroup uint32_t *id_mem [[threadgroup(1)]],
+        threadgroup float    *top_vals [[threadgroup(2)]],
+        threadgroup uint32_t *top_ids [[threadgroup(3)]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint ntg [[threads_per_threadgroup]]) {
+    uint32_t k = min(args.top_k, args.out_dim);
+    k = min(k, 1024u);
+    if (k == 0u) {
+        if (tid == 0) out_idx[0] = 0;
+        return;
+    }
+
+    for (uint32_t i = tid; i < k; i += ntg) {
+        top_vals[i] = -INFINITY;
+        top_ids[i] = 0xffffffffu;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float prev_v = INFINITY;
+    uint32_t prev_id = 0u;
+    for (uint32_t rank = 0; rank < k; rank++) {
+        float best = -INFINITY;
+        uint32_t best_id = 0xffffffffu;
+        for (uint32_t id = tid; id < args.out_dim; id += ntg) {
+            const float v = scores[id];
+            if (!isfinite(v)) continue;
+            if (rank != 0u && !(v < prev_v || (v == prev_v && id > prev_id))) continue;
+            if (ds4_output_sample_better(v, id, best, best_id)) {
+                best = v;
+                best_id = id;
+            }
+        }
+
+        score_mem[tid] = best;
+        id_mem[tid] = best_id;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride &&
+                ds4_output_sample_better(score_mem[tid + stride],
+                                         id_mem[tid + stride],
+                                         score_mem[tid],
+                                         id_mem[tid])) {
+                score_mem[tid] = score_mem[tid + stride];
+                id_mem[tid] = id_mem[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0) {
+            top_vals[rank] = score_mem[0];
+            top_ids[rank] = id_mem[0];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (top_ids[rank] == 0xffffffffu) break;
+        prev_v = top_vals[rank];
+        prev_id = top_ids[rank];
+    }
+
+    const float inv_t = 1.0f / max(args.temperature, 1.0e-20f);
+    float best = -INFINITY;
+    uint32_t best_id = 0xffffffffu;
+    for (uint32_t i = tid; i < k; i += ntg) {
+        const uint32_t id = top_ids[i];
+        if (id == 0xffffffffu) continue;
+        const float v = top_vals[i] * inv_t + ds4_output_sample_gumbel(args.seed, id);
+        if (ds4_output_sample_better(v, id, best, best_id)) {
+            best = v;
+            best_id = id;
+        }
+    }
+
+    score_mem[tid] = best;
+    id_mem[tid] = best_id;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride &&
+            ds4_output_sample_better(score_mem[tid + stride],
+                                     id_mem[tid + stride],
+                                     score_mem[tid],
+                                     id_mem[tid])) {
+            score_mem[tid] = score_mem[tid + stride];
+            id_mem[tid] = id_mem[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) out_idx[0] = id_mem[0] == 0xffffffffu ? 0 : (int32_t)id_mem[0];
+}
+
 // Decode shared-expert gate/up projections followed by SwiGLU:
 //
 //     mid = silu(min(gate, limit)) * clamp(up, -limit, limit)
