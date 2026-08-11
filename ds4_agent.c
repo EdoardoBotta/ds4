@@ -4020,6 +4020,8 @@ static bool agent_mkdir_p(const char *path) {
 }
 
 static char *agent_default_cache_dir(void) {
+    const char *override = getenv("DS4_AGENT_CACHE_DIR");
+    if (override && override[0]) return xstrdup(override);
     const char *home = getenv("HOME");
     if (!home || !home[0]) home = ".";
     agent_buf b = {0};
@@ -4325,7 +4327,7 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         return false;
     }
     const int quant_bits = ds4_engine_routed_quant_bits(w->engine);
-    if (quant_bits != 2 && quant_bits != 4) {
+    if (quant_bits != 0 && quant_bits != 2 && quant_bits != 4) {
         snprintf(err, err_len, "unsupported routed quantization for KV save");
         return false;
     }
@@ -4664,6 +4666,9 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
         if (loaded) {
             agent_trace(w, "sysprompt kv hit file=%s tokens=%d",
                         w->sysprompt_path, w->transcript.len);
+        } else if (load_err[0]) {
+            agent_trace(w, "sysprompt kv miss file=%s reason=%s",
+                        w->sysprompt_path, load_err);
         }
     }
 

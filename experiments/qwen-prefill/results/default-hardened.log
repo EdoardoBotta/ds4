@@ -1,0 +1,43 @@
+ds4: Metal device Apple M4 Pro, 48.00 GiB RAM
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.897 ms, residency requested in 220.178 ms, warmup 3.307 ms (mapped 27260.56 MiB from offset 10.48 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: attention KV 0.06 GiB + recurrent state 0.15 GiB + buffers 0.64 GiB + resident model 26.62 GiB = 27.47 GiB planned
+ds4: memory detail: ctx=1024 full_attention_layers=16 gated_deltanet_layers=48 sessions=1 backend=metal
+ds4: memory: KV 0.21 GiB (raw 0.06 + compressed 0.15) + buffers 0.64 GiB = 0.85 GiB context
+ds4: memory detail: ctx=1024 prefill_cap=1024 raw_kv_rows=1024 compressed_kv_rows=1 backend=metal
+ds4: using GPU graph generation with graph prefill
+ds4: using Qwen3.6 resident Metal generation path
+ds4: Metal memory after Qwen3.6 graph alloc: runtime 0.80 GiB + streaming experts 0.00 GiB = 0.80 GiB tracked live
+ds4:   runtime tensors live 819.42 MiB peak 819.42 MiB
+ds4:   macOS task memory footprint 0.27 GiB, resident 0.22 GiB, virtual 442.77 GiB
+ds4:   mmap model wrapper spans 1 buffers 26.62 GiB total, 26.62 GiB max (not copied)
+ds4:   model residency requests 1
+ds4:   device Apple M4 Pro, Metal 4 runtime no, family no, MTL4 queue no, tensor API disabled, M5 neural accelerators not detected
+ds4:   accelerated Metal path disabled (tensor API unavailable)
+ds4:   device Apple M4 Pro, Metal 4 runtime no, family no, MTL4 queue no, tensor API disabled, M5 neural accelerators not detected
+ds4:   scratch 0.00 MiB (flash mask 0.00, pad 0.00, tmp 0.00, blk 0.00, ring 0.00, kv 0.00, compressor 0.00, router 0.00, indexer 0.00, moe 0.00, f16 0.00, raw-store 0.00)
+processing 695 input tokens: 695/695 (100.0%)
+ds4: Metal memory after Qwen3.6 prefill: runtime 0.80 GiB + streaming experts 0.00 GiB = 0.80 GiB tracked live
+ds4:   runtime tensors live 819.42 MiB peak 819.42 MiB
+ds4:   macOS task memory footprint 0.93 GiB, resident 0.22 GiB, virtual 442.77 GiB
+ds4:   mmap model wrapper spans 1 buffers 26.62 GiB total, 26.62 GiB max (not copied)
+ds4:   model residency requests 1
+ds4:   device Apple M4 Pro, Metal 4 runtime no, family no, MTL4 queue no, tensor API disabled, M5 neural accelerators not detected
+ds4:   accelerated Metal path disabled (tensor API unavailable)
+ds4:   device Apple M4 Pro, Metal 4 runtime no, family no, MTL4 queue no, tensor API disabled, M5 neural accelerators not detected
+ds4:   scratch 3.97 MiB (flash mask 0.92, pad 0.33, tmp 0.00, blk 0.00, ring 0.00, kv 2.71, compressor 0.00, router 0.00, indexer 0.00, moe 0.00, f16 0.00, raw-store 0.00)
+ds4: Qwen3.6 prefill: 125.60 t/s, generation: 10752.69 t/s
+ds4: Metal memory before Qwen3.6 graph free: runtime 0.80 GiB + streaming experts 0.00 GiB = 0.80 GiB tracked live
+ds4:   runtime tensors live 819.42 MiB peak 819.42 MiB
+ds4:   macOS task memory footprint 0.93 GiB, resident 0.22 GiB, virtual 442.77 GiB
+ds4:   mmap model wrapper spans 1 buffers 26.62 GiB total, 26.62 GiB max (not copied)
+ds4:   model residency requests 1
+ds4:   device Apple M4 Pro, Metal 4 runtime no, family no, MTL4 queue no, tensor API disabled, M5 neural accelerators not detected
+ds4:   accelerated Metal path disabled (tensor API unavailable)
+ds4:   device Apple M4 Pro, Metal 4 runtime no, family no, MTL4 queue no, tensor API disabled, M5 neural accelerators not detected
+ds4:   scratch 3.97 MiB (flash mask 0.92, pad 0.33, tmp 0.00, blk 0.00, ring 0.00, kv 2.71, compressor 0.00, router 0.00, indexer 0.00, moe 0.00, f16 0.00, raw-store 0.00)
+real 6.21
+user 0.05
+sys 0.32

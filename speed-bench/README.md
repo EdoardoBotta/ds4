@@ -38,11 +38,15 @@ make metal-decode-schedule-bench
   --include-selection
 ```
 
-The harness prefills two sessions and alternates both variant order and
-variant-to-session assignment. It aborts unless every full-vocabulary logit
-row is bit-identical and, with `--include-selection`, both variants select the
-same non-EOS token. Use `--candidate-env NAME` to measure a rollback control,
-or `--help` to compare explicit split schedules.
+The harness defaults to a memory-bounded serial comparison: only one session
+is live at a time, both variants replay the same forced token stream, and the
+first run's full-vocabulary rows are kept in a temporary file for comparison.
+Use `--serial-reverse` for the opposite order. It aborts unless every logit row
+is bit-identical and, with `--include-selection`, both variants select the same
+non-EOS token. `--parallel-sessions` explicitly opts into the older two-live-
+session mode; do not use it for large resident models unless the combined
+footprint has been checked first. Use `--candidate-env NAME` to measure a
+rollback control, or `--help` to compare explicit split schedules.
 
 To compare the default pre-M5 ratio-4 compressor pack/transpose fusion with the
 legacy decode path, including token selection, use:

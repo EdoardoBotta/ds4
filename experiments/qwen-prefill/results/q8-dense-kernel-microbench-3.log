@@ -1,0 +1,29 @@
+Q8 prefill bench shape K=5120 M=17408 N=695 model=90.31 MiB scratch=59.73 MiB
+ds4: Metal device Apple M4 Pro, 48.00 GiB RAM
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal model views created in 0.019 ms, residency requested in 0.802 ms, warmup 1.849 ms (mapped 90.31 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+Q8 prefill bench pairs32 bit-exact over 12098560 outputs
+Q8 prefill bench pairs64 bit-exact over 12098560 outputs
+Q8 prefill bench baseline median= 19.297 ms runs=9
+Q8 prefill bench pairs32  median= 19.362 ms runs=9
+Q8 prefill bench pairs64  median= 19.248 ms runs=9
+Q8 prefill bench speedup pairs32=-0.34% pairs64=+0.25%
+        0.74 real         0.06 user         0.01 sys
+           305659904  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+               18916  page reclaims
+                   1  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+                 236  involuntary context switches
+          1915664213  instructions retired
+           362151288  cycles elapsed
+           374473520  peak memory footprint

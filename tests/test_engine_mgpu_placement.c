@@ -82,6 +82,15 @@ size_t ds4_test_compute_glm_entry_bytes_sum_with_sessions(
                                          int n_tensors,
                                          int placement_ctx_hint,
                                          int placement_session_count_hint);
+void ds4_test_qwen_context_memory(uint32_t ctx_size,
+                                  uint64_t *attention_kv_bytes,
+                                  uint64_t *recurrent_state_bytes,
+                                  uint64_t *scratch_bytes,
+                                  uint64_t *total_bytes);
+uint32_t ds4_test_qwen_gdn_qk_head(uint32_t value_head);
+
+static char *save_env_value(const char *name);
+static void restore_env_value(const char *name, char *value);
 
 /* DS4_N_LAYER constant is private to ds4.c; for the test we use
  * the same value. (The packer header doesn't expose it.) */
@@ -527,6 +536,65 @@ static void test_glm_session_count_accounting(void) {
           "four GLM sessions reserve four independent compact caches");
 }
 
+static void test_qwen_context_memory_accounting(void) {
+    fprintf(stderr, "RUN: test_qwen_context_memory_accounting\n");
+    char *saved_flash = save_env_value("DS4_QWEN_FLASH_ATTN");
+    char *saved_chunk = save_env_value("DS4_QWEN_PREFILL_CHUNK");
+    char *saved_batched = save_env_value("DS4_QWEN_BATCHED_PREFILL");
+    char *saved_gdn = save_env_value("DS4_QWEN_GDN_CHUNKWISE");
+    unsetenv("DS4_QWEN_FLASH_ATTN");
+    unsetenv("DS4_QWEN_PREFILL_CHUNK");
+    unsetenv("DS4_QWEN_BATCHED_PREFILL");
+    unsetenv("DS4_QWEN_GDN_CHUNKWISE");
+
+    uint64_t kv32 = 0, recurrent32 = 0, scratch32 = 0, total32 = 0;
+    uint64_t kv262 = 0, recurrent262 = 0, scratch262 = 0, total262 = 0;
+    uint64_t scratch32_nonflash = 0, scratch262_nonflash = 0;
+    ds4_test_qwen_context_memory(32768u, &kv32, &recurrent32,
+                                 &scratch32, &total32);
+    ds4_test_qwen_context_memory(262144u, &kv262, &recurrent262,
+                                 &scratch262, &total262);
+    setenv("DS4_QWEN_FLASH_ATTN", "0", 1);
+    ds4_test_qwen_context_memory(32768u, NULL, NULL,
+                                 &scratch32_nonflash, NULL);
+    ds4_test_qwen_context_memory(262144u, NULL, NULL,
+                                 &scratch262_nonflash, NULL);
+
+    restore_env_value("DS4_QWEN_FLASH_ATTN", saved_flash);
+    restore_env_value("DS4_QWEN_PREFILL_CHUNK", saved_chunk);
+    restore_env_value("DS4_QWEN_BATCHED_PREFILL", saved_batched);
+    restore_env_value("DS4_QWEN_GDN_CHUNKWISE", saved_gdn);
+
+    CHECK(kv32 == UINT64_C(2) * 1024u * 1024u * 1024u,
+          "Qwen 32K context prices 2 GiB of full-attention KV");
+    CHECK(kv262 == UINT64_C(16) * 1024u * 1024u * 1024u,
+          "Qwen 262K context prices 16 GiB of full-attention KV");
+    CHECK(recurrent32 == recurrent262 && recurrent32 != 0,
+          "Qwen recurrent and convolution state is fixed per session");
+    CHECK(scratch262 - scratch32 ==
+              UINT64_C(1) * 24u * (262144u - 32768u) * sizeof(float),
+          "Qwen FlashAttention scratch has one context-sized score row");
+    CHECK(scratch262_nonflash - scratch32_nonflash ==
+              UINT64_C(1024) * 24u * (262144u - 32768u) * sizeof(float),
+          "Qwen non-flash scratch has one context-sized score row per prefill token");
+    CHECK(total32 == kv32 + recurrent32 + scratch32 &&
+          total262 == kv262 + recurrent262 + scratch262,
+          "Qwen total memory includes KV, recurrent state, and scratch");
+}
+
+static void test_qwen_gdn_tiled_head_mapping(void) {
+    fprintf(stderr, "RUN: test_qwen_gdn_tiled_head_mapping\n");
+    CHECK(ds4_test_qwen_gdn_qk_head(0u) == 0u &&
+          ds4_test_qwen_gdn_qk_head(15u) == 15u,
+          "Qwen first GDN value-head tile maps directly to Q/K heads");
+    CHECK(ds4_test_qwen_gdn_qk_head(16u) == 0u &&
+          ds4_test_qwen_gdn_qk_head(31u) == 15u,
+          "Qwen second GDN value-head tile wraps by modulo");
+    CHECK(ds4_test_qwen_gdn_qk_head(32u) == 0u &&
+          ds4_test_qwen_gdn_qk_head(47u) == 15u,
+          "Qwen third GDN value-head tile wraps by modulo");
+}
+
 static char *save_env_value(const char *name) {
     const char *v = getenv(name);
     if (!v) return NULL;
@@ -677,6 +745,8 @@ int main(void) {
     test_no_per_layer_scratch_double_count();
     test_glm_per_layer_cache_accounting();
     test_glm_session_count_accounting();
+    test_qwen_context_memory_accounting();
+    test_qwen_gdn_tiled_head_mapping();
     test_cuda_tp_prefill_default_accounting();
     test_cuda_tp_output_head_moves_to_lower_half();
 

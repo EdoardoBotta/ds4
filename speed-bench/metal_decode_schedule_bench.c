@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -29,11 +30,15 @@ typedef struct {
     const char *model_path;
     const char *prompt_path;
     const char *candidate_env;
+    const char *candidate_env_value;
     int prefix_tokens;
     int ctx;
     int warmup;
     int measured;
     bool include_selection;
+    bool allow_logit_drift;
+    bool serial_sessions;
+    bool serial_reverse;
     decode_schedule control;
     decode_schedule candidate;
 } bench_config;
@@ -53,7 +58,12 @@ static void usage(FILE *fp, const char *argv0) {
             "  --candidate-first N    candidate first split (default: 1; control with --candidate-env)\n"
             "  --candidate-second N   candidate second split (default: 32; control with --candidate-env)\n"
             "  --candidate-env NAME   unset NAME for control, set NAME=1 for candidate\n"
-            "  --include-selection    include one non-EOS argmax in each timed step\n",
+            "  --candidate-env-value V  candidate environment value (default: 1)\n"
+            "  --include-selection    include one non-EOS argmax in each timed step\n"
+            "  --allow-logit-drift    report serial mismatches instead of aborting\n"
+            "  --serial-sessions      compare one session at a time (default)\n"
+            "  --serial-reverse       serial mode with candidate before control\n"
+            "  --parallel-sessions    opt in to two simultaneously live sessions\n",
             argv0);
 }
 
@@ -87,11 +97,15 @@ static bench_config parse_options(int argc, char **argv) {
         .model_path = "ds4flash.gguf",
         .prompt_path = "ds4.c",
         .candidate_env = NULL,
+        .candidate_env_value = "1",
         .prefix_tokens = DEFAULT_PREFIX_TOKENS,
         .ctx = DEFAULT_CTX,
         .warmup = DEFAULT_WARMUP,
         .measured = DEFAULT_MEASURED,
         .include_selection = false,
+        .allow_logit_drift = false,
+        .serial_sessions = true,
+        .serial_reverse = false,
         .control = {.first = 2, .second = 32},
         .candidate = {.first = 1, .second = 32},
     };
@@ -109,8 +123,20 @@ static bench_config parse_options(int argc, char **argv) {
             cfg.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--candidate-env")) {
             cfg.candidate_env = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--candidate-env-value")) {
+            cfg.candidate_env_value = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--include-selection")) {
             cfg.include_selection = true;
+        } else if (!strcmp(arg, "--allow-logit-drift")) {
+            cfg.allow_logit_drift = true;
+        } else if (!strcmp(arg, "--serial-sessions")) {
+            cfg.serial_sessions = true;
+        } else if (!strcmp(arg, "--parallel-sessions")) {
+            cfg.serial_sessions = false;
+            cfg.serial_reverse = false;
+        } else if (!strcmp(arg, "--serial-reverse")) {
+            cfg.serial_sessions = true;
+            cfg.serial_reverse = true;
         } else if (!strcmp(arg, "--prefix-tokens")) {
             cfg.prefix_tokens =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg, 1);
@@ -249,7 +275,7 @@ static int select_variant(const bench_config *cfg, int variant) {
     if (cfg->candidate_env &&
         (variant == 0
              ? unsetenv(cfg->candidate_env)
-             : setenv(cfg->candidate_env, "1", 1)) != 0) {
+             : setenv(cfg->candidate_env, cfg->candidate_env_value, 1)) != 0) {
         fprintf(stderr,
                 "metal-decode-schedule-bench: failed to select candidate "
                 "environment %s for %s: %s\n",
@@ -357,6 +383,250 @@ static int compare_frontier(
     return 0;
 }
 
+/* Qwen's current Metal graph owns backend-global recurrent scratch, so two
+ * live sessions are not a valid correctness oracle for a long decode.  This
+ * mode keeps only one session live, replays an identical forced token stream,
+ * and stores the first run's full-vocabulary rows in a temporary file for an
+ * exact comparison with the second run. */
+static int run_serial_benchmark(
+        const bench_config *cfg,
+        ds4_engine         *engine,
+        const ds4_tokens   *tokens,
+        const ds4_tokens   *prefix,
+        int                 vocab,
+        int                 eos,
+        char               *err,
+        size_t              err_cap) {
+    const int total_steps = cfg->warmup + cfg->measured;
+    if ((int64_t)cfg->prefix_tokens + total_steps > tokens->len) {
+        fprintf(stderr,
+                "metal-decode-schedule-bench: serial token source has %d "
+                "tokens; need %d\n",
+                tokens->len,
+                cfg->prefix_tokens + total_steps);
+        return 1;
+    }
+
+    const size_t row_bytes = (size_t)vocab * sizeof(float);
+    float *reference_row = malloc(row_bytes);
+    float *current_row = malloc(row_bytes);
+    int *reference_selected = cfg->include_selection
+        ? malloc((size_t)total_steps * sizeof(int)) : NULL;
+    FILE *reference = tmpfile();
+    if (!reference_row || !current_row ||
+        (cfg->include_selection && !reference_selected) || !reference) {
+        fprintf(stderr,
+                "metal-decode-schedule-bench: serial reference allocation failed\n");
+        free(reference_row);
+        free(current_row);
+        free(reference_selected);
+        if (reference) fclose(reference);
+        return 1;
+    }
+
+    fprintf(stderr,
+            "metal-decode-schedule-bench: serial model=%s prompt=%s prefix=%d "
+            "ctx=%d warmup=%d measured=%d order=%s candidate_env=%s=%s "
+            "include_selection=%s\n",
+            cfg->model_path,
+            cfg->prompt_path,
+            cfg->prefix_tokens,
+            cfg->ctx,
+            cfg->warmup,
+            cfg->measured,
+            cfg->serial_reverse ? "candidate-control" : "control-candidate",
+            cfg->candidate_env ? cfg->candidate_env : "(none)",
+            cfg->candidate_env ? cfg->candidate_env_value : "(none)",
+            cfg->include_selection ? "yes" : "no");
+
+    double elapsed[VARIANT_COUNT] = {0};
+    size_t measured_tokens[VARIANT_COUNT] = {0};
+    size_t exact_rows = 0;
+    size_t exact_floats = 0;
+    size_t exact_selected_ids = 0;
+    size_t drift_rows = 0;
+    size_t drift_floats = 0;
+    size_t differing_selected_ids = 0;
+    float max_abs_drift = 0.0f;
+    int rc = 1;
+
+    for (int pass = 0; pass < VARIANT_COUNT; pass++) {
+        const int variant = cfg->serial_reverse ? 1 - pass : pass;
+        ds4_session *session = NULL;
+        if (select_variant(cfg, variant) != 0 ||
+            ds4_session_create(&session, engine, cfg->ctx) != 0 ||
+            ds4_session_sync(session, prefix, err, err_cap) != 0) {
+            fprintf(stderr,
+                    "metal-decode-schedule-bench: serial %s setup failed: %s\n",
+                    variant == 0 ? "control" : "candidate",
+                    err[0] ? err : "unknown error");
+            if (session) ds4_session_free(session);
+            goto done;
+        }
+
+        if (pass == 1) rewind(reference);
+        for (int step = 0; step < total_steps; step++) {
+            const int token = tokens->v[cfg->prefix_tokens + step];
+            const double t0 = now_sec();
+            if (ds4_session_eval(session, token, err, err_cap) != 0) {
+                fprintf(stderr,
+                        "metal-decode-schedule-bench: serial decode failed at "
+                        "step=%d variant=%s: %s\n",
+                        step,
+                        variant == 0 ? "control" : "candidate",
+                        err[0] ? err : "unknown error");
+                ds4_session_free(session);
+                goto done;
+            }
+            int selected = -1;
+            if (cfg->include_selection) {
+                selected = ds4_session_argmax_excluding(session, eos);
+                if (selected < 0) {
+                    fprintf(stderr,
+                            "metal-decode-schedule-bench: serial selection "
+                            "failed at step=%d variant=%s\n",
+                            step,
+                            variant == 0 ? "control" : "candidate");
+                    ds4_session_free(session);
+                    goto done;
+                }
+            }
+            const double t1 = now_sec();
+            if (step >= cfg->warmup) {
+                elapsed[variant] += t1 - t0;
+                measured_tokens[variant]++;
+            }
+
+            memset(current_row, 0xa5, row_bytes);
+            if (ds4_session_copy_logits(session, current_row, vocab) != vocab) {
+                fprintf(stderr,
+                        "metal-decode-schedule-bench: serial logit copy failed "
+                        "at step=%d variant=%s\n",
+                        step,
+                        variant == 0 ? "control" : "candidate");
+                ds4_session_free(session);
+                goto done;
+            }
+
+            if (pass == 0) {
+                if (fwrite(current_row, 1, row_bytes, reference) != row_bytes) {
+                    fprintf(stderr,
+                            "metal-decode-schedule-bench: serial reference write "
+                            "failed at step=%d\n",
+                            step);
+                    ds4_session_free(session);
+                    goto done;
+                }
+                if (reference_selected) reference_selected[step] = selected;
+            } else {
+                if (fread(reference_row, 1, row_bytes, reference) != row_bytes) {
+                    fprintf(stderr,
+                            "metal-decode-schedule-bench: serial reference read "
+                            "failed at step=%d\n",
+                            step);
+                    ds4_session_free(session);
+                    goto done;
+                }
+                if (memcmp(reference_row, current_row, row_bytes) != 0) {
+                    size_t first = SIZE_MAX;
+                    size_t differing = 0;
+                    for (int i = 0; i < vocab; i++) {
+                        if (memcmp(&reference_row[i], &current_row[i],
+                                   sizeof(float)) != 0) {
+                            if (first == SIZE_MAX) first = (size_t)i;
+                            differing++;
+                            const float delta =
+                                fabsf(reference_row[i] - current_row[i]);
+                            if (delta > max_abs_drift) max_abs_drift = delta;
+                        }
+                    }
+                    drift_rows++;
+                    drift_floats += differing;
+                    if (!cfg->allow_logit_drift) {
+                        fprintf(stderr,
+                                "metal-decode-schedule-bench: serial raw logit "
+                                "mismatch at step=%d differing=%zu/%d\n",
+                                step,
+                                differing,
+                                vocab);
+                        if (first != SIZE_MAX) {
+                            fprintf(stderr,
+                                    "metal-decode-schedule-bench: first mismatch "
+                                    "id=%zu reference=%a (0x%08x) current=%a "
+                                    "(0x%08x)\n",
+                                    first,
+                                    reference_row[first],
+                                    (unsigned)float_bits(reference_row[first]),
+                                    current_row[first],
+                                    (unsigned)float_bits(current_row[first]));
+                        }
+                        ds4_session_free(session);
+                        goto done;
+                    }
+                } else {
+                    exact_rows++;
+                    exact_floats += (size_t)vocab;
+                }
+                if (reference_selected) {
+                    if (reference_selected[step] != selected) {
+                        differing_selected_ids++;
+                        if (!cfg->allow_logit_drift) {
+                            fprintf(stderr,
+                                    "metal-decode-schedule-bench: serial "
+                                    "selection mismatch at step=%d reference=%d "
+                                    "current=%d\n",
+                                    step,
+                                    reference_selected[step],
+                                    selected);
+                            ds4_session_free(session);
+                            goto done;
+                        }
+                    } else {
+                        exact_selected_ids++;
+                    }
+                }
+            }
+        }
+        ds4_session_free(session);
+    }
+
+    for (int variant = 0; variant < VARIANT_COUNT; variant++) {
+        const decode_schedule *schedule =
+            variant == 0 ? &cfg->control : &cfg->candidate;
+        printf("variant=%s first_split=%d second_split=%d tokens=%zu "
+               "seconds=%.6f tokens_per_second=%.4f\n",
+               variant == 0 ? "control" : "candidate",
+               schedule->first,
+               schedule->second,
+               measured_tokens[variant],
+               elapsed[variant],
+               elapsed[variant] > 0.0
+                   ? (double)measured_tokens[variant] / elapsed[variant]
+                   : 0.0);
+    }
+    printf("exact_rows=%zu exact_floats=%zu exact_selected_ids=%zu vocab=%d\n",
+           exact_rows,
+           exact_floats,
+           exact_selected_ids,
+           vocab);
+    if (cfg->allow_logit_drift) {
+        printf("drift_rows=%zu drift_floats=%zu max_abs_drift=%g "
+               "differing_selected_ids=%zu\n",
+               drift_rows,
+               drift_floats,
+               max_abs_drift,
+               differing_selected_ids);
+    }
+    rc = 0;
+
+done:
+    fclose(reference);
+    free(reference_row);
+    free(current_row);
+    free(reference_selected);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     const bench_config cfg = parse_options(argc, argv);
     char *text = read_text(cfg.prompt_path);
@@ -419,6 +689,18 @@ int main(int argc, char **argv) {
         .len = cfg.prefix_tokens,
         .cap = cfg.prefix_tokens,
     };
+    const int eos = ds4_token_eos(engine);
+    if (cfg.serial_sessions) {
+        rc = run_serial_benchmark(&cfg,
+                                  engine,
+                                  &tokens,
+                                  &prefix,
+                                  vocab,
+                                  eos,
+                                  err,
+                                  sizeof(err));
+        goto done;
+    }
     for (int i = 0; i < VARIANT_COUNT; i++) {
         if (ds4_session_create(&sessions[i], engine, cfg.ctx) != 0 ||
             ds4_session_sync(sessions[i], &prefix, err, sizeof(err)) != 0) {
@@ -439,7 +721,7 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "metal-decode-schedule-bench: model=%s prompt=%s prefix=%d "
             "ctx=%d warmup=%d measured=%d control=%d/%d candidate=%d/%d "
-            "candidate_env=%s include_selection=%s\n",
+            "candidate_env=%s=%s include_selection=%s\n",
             cfg.model_path,
             cfg.prompt_path,
             cfg.prefix_tokens,
@@ -451,9 +733,9 @@ int main(int argc, char **argv) {
             cfg.candidate.first,
             cfg.candidate.second,
             cfg.candidate_env ? cfg.candidate_env : "(none)",
+            cfg.candidate_env ? cfg.candidate_env_value : "(none)",
             cfg.include_selection ? "yes" : "no");
 
-    const int eos = ds4_token_eos(engine);
     const int total_steps = cfg.warmup + cfg.measured;
     for (int step = 0; step < total_steps; step++) {
         int token = -1;

@@ -181,6 +181,379 @@ static test_float_compare_stats test_compare_float_bits(
     return stats;
 }
 
+static float test_qwen_gdn_max_abs_finite(
+        const float *reference,
+        const float *actual,
+        size_t count,
+        bool *finite) {
+    float max_abs = 0.0f;
+    *finite = true;
+    for (size_t i = 0; i < count; i++) {
+        if (!isfinite(reference[i]) || !isfinite(actual[i])) *finite = false;
+        const float err = fabsf(reference[i] - actual[i]);
+        if (err > max_abs) max_abs = err;
+    }
+    return max_abs;
+}
+
+/* Host implementation of the same extended-WY equations used by the Metal
+ * chunk kernel.  This is deliberately compared with the existing token-wise
+ * recurrence for short, ragged, and full Qwen prefill chunks. */
+static void test_qwen_gdn_chunkwise_math(void) {
+    enum { C = 16, D = 8, QH = 2, VH = 3, CHANNELS = (2 * QH + VH) * D };
+    float prepared[C * CHANNELS];
+    float gate[C * VH];
+    float beta[C * VH];
+    float initial[VH * D * D];
+    const uint32_t chunks[] = {2u, 3u, 8u, 16u};
+
+    for (uint32_t t = 0; t < C; t++) {
+        for (uint32_t x = 0; x < CHANNELS; x++) {
+            prepared[t * CHANNELS + x] =
+                (float)((int)((t * 37u + x * 17u) % 47u) - 23) / 73.0f;
+        }
+        for (uint32_t h = 0; h < QH; h++) {
+            for (uint32_t qk = 0; qk < 2u; qk++) {
+                float ss = 0.0f;
+                float *v = prepared + t * CHANNELS + (qk * QH + h) * D;
+                for (uint32_t d = 0; d < D; d++) ss += v[d] * v[d];
+                const float inv = 1.0f / sqrtf(ss + 1.0e-6f);
+                for (uint32_t d = 0; d < D; d++) v[d] *= inv;
+            }
+        }
+        for (uint32_t h = 0; h < VH; h++) {
+            gate[t * VH + h] =
+                -0.015f * (float)(1u + (t * 3u + h) % 7u);
+            beta[t * VH + h] =
+                0.2f + 0.075f * (float)((t + 2u * h) % 7u);
+        }
+    }
+    for (uint32_t i = 0; i < VH * D * D; i++) {
+        initial[i] = (float)((int)((i * 13u) % 31u) - 15) / 401.0f;
+    }
+
+    for (size_t ci = 0; ci < sizeof(chunks) / sizeof(chunks[0]); ci++) {
+        const uint32_t n = chunks[ci];
+        float ref_state[VH * D * D], chunk_state[VH * D * D];
+        float ref_out[C * VH * D] = {0}, chunk_out[C * VH * D] = {0};
+        float cumulative[C * VH] = {0};
+        float tri[VH * C * C] = {0};
+        float w[C * VH * D] = {0}, u[C * VH * D] = {0};
+        float values[C * VH * D] = {0}, qk[C * VH * C] = {0};
+        memcpy(ref_state, initial, sizeof(initial));
+        memcpy(chunk_state, initial, sizeof(initial));
+
+        for (uint32_t h = 0; h < VH; h++) {
+            const uint32_t qkh = h % QH;
+            for (uint32_t t = 0; t < n; t++) {
+                const float *token = prepared + t * CHANNELS;
+                const float *q = token + qkh * D;
+                const float *k = token + (QH + qkh) * D;
+                const float *v = token + 2u * QH * D + h * D;
+                const float decay = expf(gate[t * VH + h]);
+                for (uint32_t row = 0; row < D; row++) {
+                    float *s = ref_state + (h * D + row) * D;
+                    float sk = 0.0f;
+                    for (uint32_t col = 0; col < D; col++) {
+                        s[col] *= decay;
+                        sk += s[col] * k[col];
+                    }
+                    const float delta =
+                        (v[row] - sk) * beta[t * VH + h];
+                    float y = 0.0f;
+                    for (uint32_t col = 0; col < D; col++) {
+                        s[col] += k[col] * delta;
+                        y += s[col] * q[col];
+                    }
+                    ref_out[(t * VH + h) * D + row] = y;
+                }
+            }
+        }
+
+        for (uint32_t h = 0; h < VH; h++) {
+            const uint32_t qkh = h % QH;
+            float sum = 0.0f;
+            for (uint32_t i = 0; i < n; i++) {
+                sum += gate[i * VH + h];
+                cumulative[i * VH + h] = sum;
+            }
+            float *a_inv = tri + h * C * C;
+            for (uint32_t i = 0; i < n; i++) {
+                for (uint32_t j = 0; j < n; j++) {
+                    if (i == j) {
+                        a_inv[i * C + j] = 1.0f;
+                    } else if (i > j) {
+                        const float *ki = prepared + i * CHANNELS + (QH + qkh) * D;
+                        const float *kj = prepared + j * CHANNELS + (QH + qkh) * D;
+                        float dot = 0.0f;
+                        for (uint32_t d = 0; d < D; d++) dot += ki[d] * kj[d];
+                        a_inv[i * C + j] = beta[i * VH + h] *
+                            expf(cumulative[i * VH + h] - cumulative[j * VH + h]) * dot;
+                    }
+                }
+            }
+            for (uint32_t i = 1; i < n; i++) {
+                for (uint32_t j = 0; j < i; j++) {
+                    float x = 0.0f;
+                    for (uint32_t k = j; k < i; k++) {
+                        x += a_inv[i * C + k] * a_inv[k * C + j];
+                    }
+                    a_inv[i * C + j] = -x;
+                }
+            }
+            for (uint32_t i = 0; i < n; i++) {
+                for (uint32_t d = 0; d < D; d++) {
+                    float wx = 0.0f, ux = 0.0f;
+                    for (uint32_t j = 0; j <= i; j++) {
+                        const float tij = a_inv[i * C + j];
+                        const float *token = prepared + j * CHANNELS;
+                        wx += tij * beta[j * VH + h] *
+                            expf(cumulative[j * VH + h]) *
+                            token[(QH + qkh) * D + d];
+                        ux += tij * beta[j * VH + h] *
+                            token[(2u * QH + h) * D + d];
+                    }
+                    w[(i * VH + h) * D + d] = wx;
+                    u[(i * VH + h) * D + d] = ux;
+                }
+                for (uint32_t j = 0; j <= i; j++) {
+                    const float *qi = prepared + i * CHANNELS + qkh * D;
+                    const float *kj = prepared + j * CHANNELS + (QH + qkh) * D;
+                    float dot = 0.0f;
+                    for (uint32_t d = 0; d < D; d++) dot += qi[d] * kj[d];
+                    qk[(i * VH + h) * C + j] = dot *
+                        expf(cumulative[i * VH + h] - cumulative[j * VH + h]);
+                }
+            }
+        }
+
+        for (uint32_t t = 0; t < n; t++) {
+            for (uint32_t h = 0; h < VH; h++) {
+                const uint32_t qkh = h % QH;
+                const float *q = prepared + t * CHANNELS + qkh * D;
+                for (uint32_t row = 0; row < D; row++) {
+                    const float *s = initial + (h * D + row) * D;
+                    float vx = u[(t * VH + h) * D + row];
+                    for (uint32_t col = 0; col < D; col++) {
+                        vx -= w[(t * VH + h) * D + col] * s[col];
+                    }
+                    values[(t * VH + h) * D + row] = vx;
+                    float y = 0.0f;
+                    for (uint32_t col = 0; col < D; col++) y += s[col] * q[col];
+                    y *= expf(cumulative[t * VH + h]);
+                    for (uint32_t j = 0; j <= t; j++) {
+                        y += qk[(t * VH + h) * C + j] *
+                             values[(j * VH + h) * D + row];
+                    }
+                    chunk_out[(t * VH + h) * D + row] = y;
+                }
+            }
+        }
+        for (uint32_t h = 0; h < VH; h++) {
+            const uint32_t qkh = h % QH;
+            const float glast = cumulative[(n - 1u) * VH + h];
+            for (uint32_t row = 0; row < D; row++) {
+                for (uint32_t col = 0; col < D; col++) {
+                    float x = expf(glast) * initial[(h * D + row) * D + col];
+                    for (uint32_t j = 0; j < n; j++) {
+                        const float *kj = prepared + j * CHANNELS + (QH + qkh) * D;
+                        x += expf(glast - cumulative[j * VH + h]) *
+                             values[(j * VH + h) * D + row] * kj[col];
+                    }
+                    chunk_state[(h * D + row) * D + col] = x;
+                }
+            }
+        }
+
+        bool out_finite = false, state_finite = false;
+        const float out_err = test_qwen_gdn_max_abs_finite(
+            ref_out, chunk_out, (size_t)n * VH * D, &out_finite);
+        const float state_err = test_qwen_gdn_max_abs_finite(
+            ref_state, chunk_state, VH * D * D, &state_finite);
+        fprintf(stderr,
+                "ds4-test: Qwen GDN host recurrent/chunk n=%u "
+                "out_max_abs=%g state_max_abs=%g\n",
+                n, out_err, state_err);
+        TEST_ASSERT(out_finite && state_finite);
+        TEST_ASSERT(out_err < 2.0e-5f);
+        TEST_ASSERT(state_err < 2.0e-5f);
+    }
+}
+
+#if defined(__APPLE__)
+static void test_metal_qwen_gdn_chunkwise_equivalence(void) {
+    enum {
+        N = 16, D = 128, QH = 1, VH = 1,
+        CHANNELS = (2 * QH + VH) * D, CONV = 2,
+    };
+    if (!ds4_gpu_init()) {
+        fprintf(stderr, "ds4-test: Qwen GDN Metal comparison skipped (no Metal device)\n");
+        return;
+    }
+
+    const uint64_t qkv_bytes = (uint64_t)N * CHANNELS * sizeof(float);
+    const uint64_t inner_bytes = (uint64_t)N * VH * D * sizeof(float);
+    const uint64_t param_bytes = (uint64_t)N * VH * sizeof(float);
+    const uint64_t conv_state_bytes =
+        (uint64_t)CHANNELS * (CONV - 1u) * sizeof(float);
+    const uint64_t state_bytes = (uint64_t)VH * D * D * sizeof(float);
+    const uint64_t chunk_qk_bytes = (uint64_t)N * N * VH * sizeof(float);
+    const uint64_t conv_weight_offset = 0;
+    const uint64_t dt_offset = (uint64_t)CHANNELS * CONV * sizeof(float);
+    const uint64_t a_offset = dt_offset + VH * sizeof(float);
+    const uint64_t norm_offset = a_offset + VH * sizeof(float);
+    const uint64_t model_bytes = test_round_up_u64(
+        norm_offset + D * sizeof(float), (uint64_t)getpagesize());
+
+    void *model_raw = NULL;
+    float *qkv_host = malloc((size_t)qkv_bytes);
+    float *z_host = malloc((size_t)inner_bytes);
+    float *alpha_host = malloc((size_t)param_bytes);
+    float *beta_host = malloc((size_t)param_bytes);
+    float *conv_host = malloc((size_t)conv_state_bytes);
+    float *state_host = malloc((size_t)state_bytes);
+    float *out_ref_host = malloc((size_t)inner_bytes);
+    float *out_chunk_host = malloc((size_t)inner_bytes);
+    float *state_ref_host = malloc((size_t)state_bytes);
+    float *state_chunk_host = malloc((size_t)state_bytes);
+    TEST_ASSERT(posix_memalign(&model_raw, (size_t)getpagesize(),
+                              (size_t)model_bytes) == 0);
+
+    ds4_gpu_tensor *out_ref = ds4_gpu_tensor_alloc(inner_bytes);
+    ds4_gpu_tensor *out_chunk = ds4_gpu_tensor_alloc(inner_bytes);
+    ds4_gpu_tensor *prepared = ds4_gpu_tensor_alloc(qkv_bytes);
+    ds4_gpu_tensor *g = ds4_gpu_tensor_alloc(param_bytes);
+    ds4_gpu_tensor *b = ds4_gpu_tensor_alloc(param_bytes);
+    ds4_gpu_tensor *work = ds4_gpu_tensor_alloc(inner_bytes);
+    ds4_gpu_tensor *chunk_w = ds4_gpu_tensor_alloc(inner_bytes);
+    ds4_gpu_tensor *chunk_u = ds4_gpu_tensor_alloc(inner_bytes);
+    ds4_gpu_tensor *chunk_qk = ds4_gpu_tensor_alloc(chunk_qk_bytes);
+    ds4_gpu_tensor *chunk_cumulative_g = ds4_gpu_tensor_alloc(param_bytes);
+    ds4_gpu_tensor *conv_ref = ds4_gpu_tensor_alloc(conv_state_bytes);
+    ds4_gpu_tensor *conv_chunk = ds4_gpu_tensor_alloc(conv_state_bytes);
+    ds4_gpu_tensor *state_ref = ds4_gpu_tensor_alloc(state_bytes);
+    ds4_gpu_tensor *state_chunk = ds4_gpu_tensor_alloc(state_bytes);
+    ds4_gpu_tensor *qkv = ds4_gpu_tensor_alloc(qkv_bytes);
+    ds4_gpu_tensor *z = ds4_gpu_tensor_alloc(inner_bytes);
+    ds4_gpu_tensor *alpha = ds4_gpu_tensor_alloc(param_bytes);
+    ds4_gpu_tensor *beta = ds4_gpu_tensor_alloc(param_bytes);
+
+    const bool allocated = model_raw && qkv_host && z_host && alpha_host &&
+        beta_host && conv_host && state_host && out_ref_host && out_chunk_host &&
+        state_ref_host && state_chunk_host && out_ref && out_chunk && prepared &&
+        g && b && work && chunk_w && chunk_u && chunk_qk && chunk_cumulative_g &&
+        conv_ref && conv_chunk && state_ref && state_chunk && qkv && z && alpha && beta;
+    TEST_ASSERT(allocated);
+    if (!allocated) goto cleanup;
+
+    memset(model_raw, 0, (size_t)model_bytes);
+    float *conv_weight = (float *)((uint8_t *)model_raw + conv_weight_offset);
+    for (uint32_t ch = 0; ch < CHANNELS; ch++) {
+        conv_weight[ch * CONV] =
+            (float)((int)((ch * 7u) % 11u) - 5) / 80.0f;
+        conv_weight[ch * CONV + 1u] = 0.85f + 0.01f * (float)(ch % 5u);
+    }
+    ((float *)((uint8_t *)model_raw + dt_offset))[0] = -0.25f;
+    ((float *)((uint8_t *)model_raw + a_offset))[0] = -0.12f;
+    float *norm = (float *)((uint8_t *)model_raw + norm_offset);
+    for (uint32_t d = 0; d < D; d++) norm[d] = 0.9f + 0.002f * (float)(d % 17u);
+
+    for (uint32_t i = 0; i < N * CHANNELS; i++) {
+        qkv_host[i] = (float)((int)((i * 29u + 7u) % 59u) - 29) / 97.0f;
+    }
+    for (uint32_t i = 0; i < N * VH * D; i++) {
+        z_host[i] = (float)((int)((i * 11u + 3u) % 37u) - 18) / 31.0f;
+    }
+    for (uint32_t i = 0; i < N * VH; i++) {
+        alpha_host[i] = -0.8f + 0.03f * (float)(i % 9u);
+        beta_host[i] = -0.4f + 0.08f * (float)(i % 11u);
+    }
+    for (uint32_t i = 0; i < CHANNELS * (CONV - 1u); i++) {
+        conv_host[i] = (float)((int)((i * 5u) % 23u) - 11) / 211.0f;
+    }
+    for (uint32_t i = 0; i < VH * D * D; i++) {
+        state_host[i] = (float)((int)((i * 13u + 5u) % 41u) - 20) / 503.0f;
+    }
+
+    TEST_ASSERT(ds4_gpu_set_model_map(model_raw, model_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(qkv, 0, qkv_host, qkv_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(z, 0, z_host, inner_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(alpha, 0, alpha_host, param_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(beta, 0, beta_host, param_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(conv_ref, 0, conv_host, conv_state_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(conv_chunk, 0, conv_host, conv_state_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(state_ref, 0, state_host, state_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_write(state_chunk, 0, state_host, state_bytes) != 0);
+
+    TEST_ASSERT(ds4_gpu_qwen35_gdn_batch_tensor(
+        out_ref, prepared, g, b, work, conv_ref, state_ref,
+        qkv, z, alpha, beta, model_raw, model_bytes,
+        conv_weight_offset, dt_offset, a_offset, norm_offset,
+        N, CHANNELS, QH, VH, D, CONV, 1.0e-6f) != 0);
+    TEST_ASSERT(ds4_gpu_qwen35_gdn_chunk_tensor(
+        out_chunk, prepared, g, b, work, chunk_w, chunk_u, chunk_qk,
+        chunk_cumulative_g, conv_chunk, state_chunk,
+        qkv, z, alpha, beta, model_raw, model_bytes,
+        conv_weight_offset, dt_offset, a_offset, norm_offset,
+        N, CHANNELS, QH, VH, D, CONV, 1.0e-6f) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(out_ref, 0, out_ref_host, inner_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(out_chunk, 0, out_chunk_host, inner_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(state_ref, 0, state_ref_host, state_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(state_chunk, 0, state_chunk_host, state_bytes) != 0);
+
+    bool out_finite = false, state_finite = false;
+    const float out_err = test_qwen_gdn_max_abs_finite(
+        out_ref_host, out_chunk_host, (size_t)N * VH * D, &out_finite);
+    const float state_err = test_qwen_gdn_max_abs_finite(
+        state_ref_host, state_chunk_host, (size_t)VH * D * D, &state_finite);
+    fprintf(stderr,
+            "ds4-test: Qwen GDN Metal recurrent/chunk n=%u "
+            "out_max_abs=%g state_max_abs=%g\n",
+            N, out_err, state_err);
+    TEST_ASSERT(out_finite && state_finite);
+    TEST_ASSERT(out_err < 2.0e-3f);
+    TEST_ASSERT(state_err < 2.0e-3f);
+
+cleanup:
+    ds4_gpu_tensor_free(out_ref);
+    ds4_gpu_tensor_free(out_chunk);
+    ds4_gpu_tensor_free(prepared);
+    ds4_gpu_tensor_free(g);
+    ds4_gpu_tensor_free(b);
+    ds4_gpu_tensor_free(work);
+    ds4_gpu_tensor_free(chunk_w);
+    ds4_gpu_tensor_free(chunk_u);
+    ds4_gpu_tensor_free(chunk_qk);
+    ds4_gpu_tensor_free(chunk_cumulative_g);
+    ds4_gpu_tensor_free(conv_ref);
+    ds4_gpu_tensor_free(conv_chunk);
+    ds4_gpu_tensor_free(state_ref);
+    ds4_gpu_tensor_free(state_chunk);
+    ds4_gpu_tensor_free(qkv);
+    ds4_gpu_tensor_free(z);
+    ds4_gpu_tensor_free(alpha);
+    ds4_gpu_tensor_free(beta);
+    free(model_raw);
+    free(qkv_host);
+    free(z_host);
+    free(alpha_host);
+    free(beta_host);
+    free(conv_host);
+    free(state_host);
+    free(out_ref_host);
+    free(out_chunk_host);
+    free(state_ref_host);
+    free(state_chunk_host);
+}
+#endif
+
+static void test_qwen_gdn_chunkwise_group(void) {
+    test_qwen_gdn_chunkwise_math();
+#if defined(__APPLE__)
+    test_metal_qwen_gdn_chunkwise_equivalence();
+#endif
+}
+
 #if defined(__APPLE__)
 static const uint32_t test_copy_f32_patterns[] = {
     0x00000000u, 0x80000000u, /* signed zero */
@@ -468,7 +841,8 @@ static void test_metal_f16_prefill_matmul(void) {
 static void test_metal_q8_0_prefill_matmul(void) {
     const uint32_t in_dim = 128;
     const uint32_t out_dim = 64;
-    const uint32_t n_tok = 128;
+    /* Exercise both the full 64-row tile and its boundary-safe tail. */
+    const uint32_t n_tok = 95;
     const uint64_t row_bytes = (uint64_t)(in_dim / 32u) * 34u;
     const uint64_t weight_bytes = (uint64_t)out_dim * row_bytes;
     const uint64_t weight_alloc = test_round_up_u64(weight_bytes, (uint64_t)getpagesize());
@@ -496,11 +870,14 @@ static void test_metal_q8_0_prefill_matmul(void) {
 
     float *x_host = malloc((size_t)x_bytes);
     float *out_host = malloc((size_t)out_bytes);
+    float *baseline_host = malloc((size_t)out_bytes);
     TEST_ASSERT(x_host != NULL);
     TEST_ASSERT(out_host != NULL);
-    if (!x_host || !out_host) {
+    TEST_ASSERT(baseline_host != NULL);
+    if (!x_host || !out_host || !baseline_host) {
         free(x_host);
         free(out_host);
+        free(baseline_host);
         ds4_gpu_tensor_free(x);
         ds4_gpu_tensor_free(out);
         free(weights_raw);
@@ -521,9 +898,35 @@ static void test_metal_q8_0_prefill_matmul(void) {
     TEST_ASSERT(ds4_gpu_tensor_write(out, 0, out_host, out_bytes) != 0);
     TEST_ASSERT(ds4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
     ds4_gpu_set_quality(false);
+
+    const char *variant_env = "DS4_METAL_Q8_PREFILL_VARIANT";
+    char *saved_variant = test_save_env(variant_env);
+    TEST_ASSERT(setenv(variant_env, "legacy", 1) == 0);
     TEST_ASSERT(ds4_gpu_matmul_q8_0_tensor(out, weights_raw, weight_alloc, 0,
                                            in_dim, out_dim, x, n_tok) != 0);
-    TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host, out_bytes) != 0);
+    TEST_ASSERT(ds4_gpu_tensor_read(out, 0, baseline_host, out_bytes) != 0);
+
+    const char *variants[] = {"default", "pairs32", "pairs64"};
+    for (size_t vi = 0; vi < sizeof(variants) / sizeof(variants[0]); vi++) {
+        if (!strcmp(variants[vi], "default")) {
+            TEST_ASSERT(unsetenv(variant_env) == 0);
+        } else {
+            TEST_ASSERT(setenv(variant_env, variants[vi], 1) == 0);
+        }
+        TEST_ASSERT(ds4_gpu_tensor_write(out, 0, out_host, out_bytes) != 0);
+        TEST_ASSERT(ds4_gpu_matmul_q8_0_tensor(out, weights_raw, weight_alloc, 0,
+                                               in_dim, out_dim, x, n_tok) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host, out_bytes) != 0);
+        const test_float_compare_stats stats =
+            test_compare_float_bits(baseline_host, out_host,
+                                    (size_t)n_tok * out_dim);
+        fprintf(stderr,
+                "ds4-test: Q8 prefill variant=%s exact=%zu/%u max_ulp=%u max_abs=%g\n",
+                variants[vi], stats.mismatch_count, n_tok * out_dim,
+                stats.max_ulp, stats.max_abs);
+        TEST_ASSERT(stats.mismatch_count == 0);
+    }
+    test_restore_env(variant_env, saved_variant);
 
     float max_abs = 0.0f;
     float rms = 0.0f;
@@ -554,6 +957,7 @@ static void test_metal_q8_0_prefill_matmul(void) {
 
     free(x_host);
     free(out_host);
+    free(baseline_host);
     ds4_gpu_tensor_free(x);
     ds4_gpu_tensor_free(out);
     free(weights_raw);
@@ -6429,6 +6833,8 @@ static const ds4_test_entry test_entries[] = {
     {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors},
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
+    {"--metal-q8-prefill", "metal-q8-prefill", "dense Q8 prefill kernel variant exactness", test_metal_q8_0_prefill_matmul},
+    {"--qwen-gdn-chunkwise", "qwen-gdn-chunkwise", "Qwen Gated DeltaNet recurrent/chunkwise equivalence", test_qwen_gdn_chunkwise_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},

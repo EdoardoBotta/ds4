@@ -197,6 +197,20 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+[[host_name("kernel_mul_mv_q8_0_f32_nr4")]]
+kernel void kernel_mul_mv_q8_0_f32_nr4(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<4, constant ds4_metal_args_mul_mv &>(
+            args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
 
 // Decode Q-A/KV pair. Both projections consume the same activation row but
 // have independent weight ranges and output extents. Keep the standalone Q8_0
@@ -1540,7 +1554,7 @@ void dequantize_dense_q4_K(device const ds4_dense_block_q4_K *xb, short il, thre
 }
 
 /*
- * Bit-identical twin of dequantize_q8_0 for the MPP staging loop: same
+ * Bit-identical twin of dequantize_q8_0 for the tiled staging loops: same
  * half(float(qs[i]) * d) per element, but the 16 consecutive int8 lanes are
  * fetched as eight aligned 16-bit loads instead of sixteen byte loads.
  * xb->qs is always 2-byte aligned (block_q8_0.d is a half).
@@ -2038,7 +2052,7 @@ template [[host_name("kernel_mul_mm_q8_0_f32_nax_direct_rhs_n128")]] kernel mul_
 // Tiled matrix-matrix kernel used for prompt batches larger than 8. DS4 uses
 // this to turn prefill into large simdgroup matrix operations; each block_q
 // contains 16*nl weights.
-template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
+template<short NR1, typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
 kernel void kernel_mul_mm(
         constant ds4_metal_args_mul_mm & args,
         device const char * src0,
@@ -2053,7 +2067,6 @@ kernel void kernel_mul_mm(
     threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
 
     constexpr int NR0 = 64;
-    constexpr int NR1 = 32;
 
     constexpr int NK  = 32;
     constexpr int NL0 = NK/16;
@@ -2106,35 +2119,41 @@ kernel void kernel_mul_mm(
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             // no need for dequantization
-            for (short i = 0; i < 16; i++) {
-                const short sx = 2*il0 + i/8;
-                const short sy = (tiitg/NL0)/8;
+            if (NR1 == 32 || tiitg < NR0*NL0) {
+                for (short i = 0; i < 16; i++) {
+                    const short sx = 2*il0 + i/8;
+                    const short sy = (tiitg/NL0)/8;
 
-                const short lx = (tiitg/NL0)%8;
-                const short ly = i%8;
+                    const short lx = (tiitg/NL0)%8;
+                    const short ly = i%8;
 
-                const short ib = 8*sx + sy;
+                    const short ib = 8*sx + sy;
 
-                *(sa + 64*ib + 8*ly + lx) = loop_k + 16*il + i < args.ne00 ? *((device T0 *) x + i) : 0;
+                    *(sa + 64*ib + 8*ly + lx) = loop_k + 16*il + i < args.ne00 ? *((device T0 *) x + i) : 0;
+                }
             }
         } else {
             S0_4x4 temp_a;
-            dequantize_func(x, il, temp_a);
+            if (NR1 == 32 || tiitg < NR0*NL0) {
+                dequantize_func(x, il, temp_a);
+            }
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            FOR_UNROLL (short i = 0; i < 16; i++) {
-                const short sx = 2*il0 + i/8;
-                const short sy = (tiitg/NL0)/8;
+            if (NR1 == 32 || tiitg < NR0*NL0) {
+                FOR_UNROLL (short i = 0; i < 16; i++) {
+                    const short sx = 2*il0 + i/8;
+                    const short sy = (tiitg/NL0)/8;
 
-                const short lx = (tiitg/NL0)%8;
-                const short ly = i%8;
+                    const short lx = (tiitg/NL0)%8;
+                    const short ly = i%8;
 
-                const short ib = 8*sx + sy;
+                    const short ib = 8*sx + sy;
 
-                // Pointer-form store avoids a slower address-lowering path in
-                // current Apple Metal compilers for this dequantized tile write.
-                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+                    // Pointer-form store avoids a slower address-lowering path in
+                    // current Apple Metal compilers for this dequantized tile write.
+                    *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
+                }
             }
         }
 
@@ -2146,7 +2165,7 @@ kernel void kernel_mul_mm(
                 const short lx = i;
                 const short ly = (tiitg/NL1)%8;
 
-                const short ib = 4*sx + sy;
+                const short ib = (NR1/8)*sx + sy;
 
                 *(sb + 64*ib + 8*ly + lx) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y + i) : 0;
             }
@@ -2156,7 +2175,7 @@ kernel void kernel_mul_mm(
 
             const short ly = (tiitg/NL1)%8;
 
-            const short ib = 4*sx + sy;
+            const short ib = (NR1/8)*sx + sy;
 
             *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) = (S1_2x4)(*((device T1_2x4 *) y));
         }
@@ -2192,7 +2211,7 @@ kernel void kernel_mul_mm(
             }
 
             lsma += 8*64;
-            lsmb += 4*64;
+            lsmb += (NR1/8)*64;
         }
     }
 
@@ -2218,7 +2237,7 @@ kernel void kernel_mul_mm(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (sgitg == 0) {
-            for (int j = tiitg; j < nr1; j += NR1) {
+            for (int j = tiitg; j < nr1; j += 32) {
                 device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
                 device float4 * D4 = (device float4 *) D;
 
@@ -2450,10 +2469,12 @@ kernel void kernel_mul_mm_f16_f32_scaled(
     }
 }
 
-typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) mul_mm_t;
+typedef decltype(kernel_mul_mm<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) mul_mm_t;
 
 // Host-visible prefill matmul variants for F16 and Q8_0 weights.
-template [[host_name("kernel_mul_mm_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, half4x4, 1, dequantize_f16,  half,  half4x4,  float, float2x4>;
-template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
-template [[host_name("kernel_mul_mm_q4_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
-template [[host_name("kernel_mul_mm_q4_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, half4x4, 1, dequantize_f16,  half,  half4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_q8_0_f32_pairs")]] kernel mul_mm_t kernel_mul_mm<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0_pairs, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_q8_0_f32_pairs_n64")]] kernel mul_mm_t kernel_mul_mm<64, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0_pairs, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_q4_0_f32")]] kernel mul_mm_t kernel_mul_mm<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_q4_K_f32")]] kernel mul_mm_t kernel_mul_mm<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4>;
