@@ -179,8 +179,8 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
         }
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
-            opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
-            opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
+            opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens; for Qwen this is verifier width including the target token. Default: 1");
+            opt(fp, c, "--mtp-margin F", "Minimum confidence margin for adaptive Qwen MTP draft extension and fast verifier acceptance; 0 forces maximum Qwen width. Default: 3");
             opt(fp, c, "--glm-mtp", "Enable integrated greedy GLM MTP speculation.");
             opt(fp, c, "--glm-mtp-timing", "Enable GLM MTP and print acceptance/timing counters.");
             opt(fp, c, "--dspark", "Enable DSpark using the support GGUF passed with --mtp.");
@@ -306,7 +306,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--raw-prompt", "Non-interactive -p only: tokenize prompt without agent chat/tool text.");
     opt(fp, c, "--edit-upto", "Enable anchored [upto] edits and automatic marker insertion.");
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
-    opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
+    opt(fp, c, "--trace FILE", "Write prompt, token, and tool-call debug trace.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
     fputc('\n', fp);
 }
@@ -542,7 +542,7 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
     else if (tool == DS4_HELP_AGENT && streq(topic, "tools")) {
         title(fp, c, "Agent Tool System");
         para(fp, c, "The agent can read, search, write, edit, run bash, and browse through Chrome-backed web tools.");
-        para(fp, c, "DeepSeek-family models emit DSML tool calls; GLM models use native <tool_call> syntax. Both are rendered live in the terminal.");
+        para(fp, c, "DeepSeek-family models emit DSML tool calls; GLM and Qwen models use their native <tool_call> formats. All are rendered live in the terminal.");
         para(fp, c, "Edit uses exact old/new replacement. --edit-upto enables anchored replacements between a unique head and tail.");
         fputc('\n', fp);
     } else if (tool == DS4_HELP_BENCH && streq(topic, "benchmark")) print_bench_specific(fp, c);

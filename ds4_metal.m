@@ -2332,15 +2332,6 @@ static uint32_t ds4_gpu_glm_full_attention_max_cache_len(void) {
     return 7680u;
 }
 
-static uint32_t ds4_gpu_glm_flash_attention_max_cache_len(void) {
-    /*
-     * Staged FlashAttention uses fixed-size threadgroup scratch and separate
-     * KV staging buffers, so it is not bound by the legacy full-attention
-     * kernel's one-score-per-token threadgroup-memory envelope.
-     */
-    return 8192u;
-}
-
 static int ds4_gpu_mpp_available(void) {
     return g_metal4_tensor_api_enabled && !g_quality_mode;
 }
@@ -29599,6 +29590,10 @@ static int ds4_gpu_qwen35_gdn_batch_impl(
         ds4_gpu_tensor       *recurrent_out,
         ds4_gpu_tensor       *conv_state,
         ds4_gpu_tensor       *ssm_state,
+        ds4_gpu_tensor       *middle_conv_state,
+        ds4_gpu_tensor       *middle_ssm_state,
+        ds4_gpu_tensor       *final_conv_state,
+        ds4_gpu_tensor       *final_ssm_state,
         const ds4_gpu_tensor *qkv,
         const ds4_gpu_tensor *z,
         const ds4_gpu_tensor *alpha,
@@ -29622,11 +29617,17 @@ static int ds4_gpu_qwen35_gdn_batch_impl(
         ds4_gpu_tensor       *chunk_cumulative_g,
         int                   chunkwise) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    const bool preserve_first =
+        middle_conv_state != NULL || middle_ssm_state != NULL ||
+        final_conv_state != NULL || final_ssm_state != NULL;
     if (!out || !prepared || !g || !b || !recurrent_out || !conv_state ||
         !ssm_state || !qkv || !z || !alpha || !beta || !model_map ||
         n_tokens == 0 || channels == 0 || qk_heads == 0 || v_heads == 0 ||
         state_dim != 128u ||
         conv_width < 2u || v_heads != channels / state_dim - 2u * qk_heads ||
+        (preserve_first && (!middle_conv_state || !middle_ssm_state ||
+                            !final_conv_state || !final_ssm_state ||
+                            n_tokens < 2u || n_tokens > 3u || chunkwise)) ||
         eps <= 0.0f || (chunkwise &&
         (n_tokens > 16u || !chunk_w || !chunk_u || !chunk_qk ||
          !chunk_cumulative_g))) return 0;
@@ -29654,6 +29655,11 @@ static int ds4_gpu_qwen35_gdn_batch_impl(
             ds4_gpu_tensor_bytes(b) < param_rows_bytes ||
             ds4_gpu_tensor_bytes(conv_state) < conv_state_bytes ||
             ds4_gpu_tensor_bytes(ssm_state) < ssm_state_bytes ||
+            (preserve_first &&
+             (ds4_gpu_tensor_bytes(middle_conv_state) < conv_state_bytes ||
+              ds4_gpu_tensor_bytes(middle_ssm_state) < ssm_state_bytes ||
+              ds4_gpu_tensor_bytes(final_conv_state) < conv_state_bytes ||
+              ds4_gpu_tensor_bytes(final_ssm_state) < ssm_state_bytes)) ||
             (chunkwise &&
              (ds4_gpu_tensor_bytes(chunk_w) < inner_bytes ||
               ds4_gpu_tensor_bytes(chunk_u) < inner_bytes ||
@@ -29678,13 +29684,16 @@ static int ds4_gpu_qwen35_gdn_batch_impl(
             (getenv("DS4_METAL_QWEN_DECODE_FUSIONS") != NULL ||
              getenv("DS4_METAL_QWEN_DECODE_GDN_PARAM_FUSION") != NULL);
         id<MTLComputePipelineState> convp = ds4_gpu_get_pipeline(
+            preserve_first ? "kernel_qwen35_gdn_conv_preserve_first" :
             fused_decode_params ? "kernel_qwen35_gdn_conv_params" :
                                   "kernel_qwen35_gdn_conv");
         id<MTLComputePipelineState> normp = ds4_gpu_get_pipeline("kernel_qwen35_gdn_qk_norm");
         id<MTLComputePipelineState> paramp = fused_decode_params ? nil :
             ds4_gpu_get_pipeline("kernel_qwen35_gdn_params");
         id<MTLComputePipelineState> recp = chunkwise ? nil :
-            ds4_gpu_get_pipeline("kernel_qwen35_gdn_recurrent");
+            ds4_gpu_get_pipeline(preserve_first ?
+                "kernel_qwen35_gdn_recurrent_preserve_first" :
+                "kernel_qwen35_gdn_recurrent");
         id<MTLComputePipelineState> chunk_preparep = chunkwise ?
             ds4_gpu_get_pipeline("kernel_qwen35_gdn_chunk_prepare") : nil;
         id<MTLComputePipelineState> chunk_valuesp = chunkwise ?
@@ -29713,7 +29722,17 @@ static int ds4_gpu_qwen35_gdn_batch_impl(
         [enc setBuffer:ds4_gpu_tensor_buffer(qkv) offset:ds4_gpu_tensor_offset(qkv) atIndex:1];
         [enc setBuffer:convbuf offset:(NSUInteger)conv_inner atIndex:2];
         [enc setBuffer:ds4_gpu_tensor_buffer(conv_state) offset:ds4_gpu_tensor_offset(conv_state) atIndex:3];
-        [enc setBuffer:ds4_gpu_tensor_buffer(prepared) offset:ds4_gpu_tensor_offset(prepared) atIndex:4];
+        if (preserve_first) {
+            [enc setBuffer:ds4_gpu_tensor_buffer(middle_conv_state)
+                    offset:ds4_gpu_tensor_offset(middle_conv_state) atIndex:4];
+            [enc setBuffer:ds4_gpu_tensor_buffer(final_conv_state)
+                    offset:ds4_gpu_tensor_offset(final_conv_state) atIndex:5];
+            [enc setBuffer:ds4_gpu_tensor_buffer(prepared)
+                    offset:ds4_gpu_tensor_offset(prepared) atIndex:6];
+        } else {
+            [enc setBuffer:ds4_gpu_tensor_buffer(prepared)
+                    offset:ds4_gpu_tensor_offset(prepared) atIndex:4];
+        }
         if (fused_decode_params) {
             [enc setBuffer:ds4_gpu_tensor_buffer(alpha) offset:ds4_gpu_tensor_offset(alpha) atIndex:5];
             [enc setBuffer:ds4_gpu_tensor_buffer(beta) offset:ds4_gpu_tensor_offset(beta) atIndex:6];
@@ -29761,7 +29780,17 @@ static int ds4_gpu_qwen35_gdn_batch_impl(
             [enc setBuffer:ds4_gpu_tensor_buffer(g) offset:ds4_gpu_tensor_offset(g) atIndex:2];
             [enc setBuffer:ds4_gpu_tensor_buffer(b) offset:ds4_gpu_tensor_offset(b) atIndex:3];
             [enc setBuffer:ds4_gpu_tensor_buffer(ssm_state) offset:ds4_gpu_tensor_offset(ssm_state) atIndex:4];
-            [enc setBuffer:ds4_gpu_tensor_buffer(recurrent_out) offset:ds4_gpu_tensor_offset(recurrent_out) atIndex:5];
+            if (preserve_first) {
+                [enc setBuffer:ds4_gpu_tensor_buffer(middle_ssm_state)
+                        offset:ds4_gpu_tensor_offset(middle_ssm_state) atIndex:5];
+                [enc setBuffer:ds4_gpu_tensor_buffer(final_ssm_state)
+                        offset:ds4_gpu_tensor_offset(final_ssm_state) atIndex:6];
+                [enc setBuffer:ds4_gpu_tensor_buffer(recurrent_out)
+                        offset:ds4_gpu_tensor_offset(recurrent_out) atIndex:7];
+            } else {
+                [enc setBuffer:ds4_gpu_tensor_buffer(recurrent_out)
+                        offset:ds4_gpu_tensor_offset(recurrent_out) atIndex:5];
+            }
             [enc dispatchThreadgroups:MTLSizeMake(state_dim / 4u, v_heads, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
@@ -29865,6 +29894,46 @@ int ds4_gpu_qwen35_gdn_batch_tensor(
         float                 eps) {
     return ds4_gpu_qwen35_gdn_batch_impl(
         out, prepared, g, b, recurrent_out, conv_state, ssm_state,
+        NULL, NULL, NULL, NULL,
+        qkv, z, alpha, beta, model_map, model_size,
+        conv_weight_offset, dt_bias_offset, a_offset, norm_offset,
+        n_tokens, channels, qk_heads, v_heads, state_dim, conv_width, eps,
+        NULL, NULL, NULL, NULL, 0);
+}
+
+int ds4_gpu_qwen35_gdn_batch_preserve_first_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *prepared,
+        ds4_gpu_tensor       *g,
+        ds4_gpu_tensor       *b,
+        ds4_gpu_tensor       *recurrent_out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *ssm_state,
+        ds4_gpu_tensor       *middle_conv_state,
+        ds4_gpu_tensor       *middle_ssm_state,
+        ds4_gpu_tensor       *final_conv_state,
+        ds4_gpu_tensor       *final_ssm_state,
+        const ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *z,
+        const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv_weight_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              a_offset,
+        uint64_t              norm_offset,
+        uint32_t              n_tokens,
+        uint32_t              channels,
+        uint32_t              qk_heads,
+        uint32_t              v_heads,
+        uint32_t              state_dim,
+        uint32_t              conv_width,
+        float                 eps) {
+    return ds4_gpu_qwen35_gdn_batch_impl(
+        out, prepared, g, b, recurrent_out, conv_state, ssm_state,
+        middle_conv_state, middle_ssm_state,
+        final_conv_state, final_ssm_state,
         qkv, z, alpha, beta, model_map, model_size,
         conv_weight_offset, dt_bias_offset, a_offset, norm_offset,
         n_tokens, channels, qk_heads, v_heads, state_dim, conv_width, eps,
@@ -29902,6 +29971,7 @@ int ds4_gpu_qwen35_gdn_chunk_tensor(
         float                 eps) {
     return ds4_gpu_qwen35_gdn_batch_impl(
         out, prepared, g, b, values, conv_state, ssm_state,
+        NULL, NULL, NULL, NULL,
         qkv, z, alpha, beta, model_map, model_size,
         conv_weight_offset, dt_bias_offset, a_offset, norm_offset,
         n_tokens, channels, qk_heads, v_heads, state_dim, conv_width, eps,
@@ -33643,8 +33713,7 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
         n_head == 0 || n_head_kv == 0 || n_head % n_head_kv != 0 ||
         qk_dim != 256u || value_dim != 256u ||
         cache_len > cache_cap ||
-        pos0 > cache_len || n_tokens > cache_len - pos0 ||
-        cache_len > ds4_gpu_glm_flash_attention_max_cache_len()) {
+        pos0 > cache_len || n_tokens > cache_len - pos0) {
         return 0;
     }
 

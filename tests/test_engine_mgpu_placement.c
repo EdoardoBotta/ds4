@@ -87,6 +87,9 @@ void ds4_test_qwen_context_memory(uint32_t ctx_size,
                                   uint64_t *recurrent_state_bytes,
                                   uint64_t *scratch_bytes,
                                   uint64_t *total_bytes);
+uint64_t ds4_test_qwen_mtp_session_memory(uint32_t ctx_size);
+uint64_t ds4_test_qwen_mtp_session_memory_rows(uint32_t ctx_size,
+                                               uint32_t spec_rows);
 uint32_t ds4_test_qwen_gdn_qk_head(uint32_t value_head);
 
 static char *save_env_value(const char *name);
@@ -96,6 +99,7 @@ static void restore_env_value(const char *name, char *value);
  * the same value. (The packer header doesn't expose it.) */
 #define DS4_N_LAYER_LOCAL 43
 #define DS4_N_VOCAB_LOCAL 129280
+#define DS4_QWEN_N_VOCAB_LOCAL 248320
 #define DS4_N_ENTRIES (DS4_N_LAYER_LOCAL + 2)
 
 static int g_failures = 0;
@@ -582,6 +586,33 @@ static void test_qwen_context_memory_accounting(void) {
           "Qwen total memory includes KV, recurrent state, and scratch");
 }
 
+static void test_qwen_mtp_memory_accounting(void) {
+    fprintf(stderr, "RUN: test_qwen_mtp_memory_accounting\n");
+    const uint32_t ctx_small = 32768u;
+    const uint32_t ctx_full = 262144u;
+    const uint64_t small = ds4_test_qwen_mtp_session_memory(ctx_small);
+    const uint64_t full = ds4_test_qwen_mtp_session_memory(ctx_full);
+    const uint64_t rows4 =
+        ds4_test_qwen_mtp_session_memory_rows(ctx_small, 4u);
+    const uint64_t bytes_per_token =
+        UINT64_C(2) * 4u * 256u * sizeof(uint16_t) +
+        UINT64_C(24) * sizeof(float);
+    const uint64_t recurrent_frontier =
+        UINT64_C(48) *
+        (((UINT64_C(2) * 16u + 48u) * 128u * 3u) +
+         (UINT64_C(48) * 128u * 128u)) * sizeof(float);
+
+    CHECK(small != 0 && full > small,
+          "Qwen MTP session memory includes fixed state and context storage");
+    CHECK(full - small ==
+              (uint64_t)(ctx_full - ctx_small) * bytes_per_token,
+          "Qwen MTP context growth includes draft KV and one score row");
+    CHECK(rows4 - small ==
+              UINT64_C(2) * (4u - 2u) * DS4_QWEN_N_VOCAB_LOCAL *
+                  sizeof(float) + recurrent_frontier,
+          "Qwen wider MTP adds verifier logits and the middle recurrent frontier");
+}
+
 static void test_qwen_gdn_tiled_head_mapping(void) {
     fprintf(stderr, "RUN: test_qwen_gdn_tiled_head_mapping\n");
     CHECK(ds4_test_qwen_gdn_qk_head(0u) == 0u &&
@@ -746,6 +777,7 @@ int main(void) {
     test_glm_per_layer_cache_accounting();
     test_glm_session_count_accounting();
     test_qwen_context_memory_accounting();
+    test_qwen_mtp_memory_accounting();
     test_qwen_gdn_tiled_head_mapping();
     test_cuda_tp_prefill_default_accounting();
     test_cuda_tp_output_head_moves_to_lower_half();

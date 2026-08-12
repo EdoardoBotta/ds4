@@ -239,6 +239,46 @@ kernel void kernel_qwen35_gdn_conv(
     }
 }
 
+// Two-row speculative verification keeps the state after the committed first
+// row in conv_state while materializing the state after the speculative second
+// row in final_state. Both rows still produce the same prepared activations as
+// the ordinary in-place batch kernel.
+kernel void kernel_qwen35_gdn_conv_preserve_first(
+        constant ds4_metal_args_qwen35_gdn &args,
+        device const float *qkv,
+        device const float *conv_weight,
+        device float *conv_state,
+        device float *middle_state,
+        device float *final_state,
+        device float *prepared,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.channels || args.n_tokens < 2u ||
+        args.n_tokens > 3u) return;
+    const uint sb = gid * (args.conv_width - 1u);
+    const uint wb = gid * args.conv_width;
+    for (uint token = 0; token < args.n_tokens; token++) {
+        device float *state = token == 0u ? conv_state :
+            (token + 1u == args.n_tokens ? final_state : middle_state);
+        if (token != 0u) {
+            device const float *previous = token == 1u ?
+                conv_state : middle_state;
+            for (uint i = 0; i + 1u < args.conv_width; i++) {
+                state[sb + i] = previous[sb + i];
+            }
+        }
+        const uint off = token * args.channels + gid;
+        float y = qkv[off] * conv_weight[wb + args.conv_width - 1u];
+        for (uint i = 0; i + 1u < args.conv_width; i++) {
+            y += state[sb + i] * conv_weight[wb + i];
+        }
+        for (uint i = 0; i + 2u < args.conv_width; i++) {
+            state[sb + i] = state[sb + i + 1u];
+        }
+        state[sb + args.conv_width - 2u] = qkv[off];
+        prepared[off] = qwen35_silu(y);
+    }
+}
+
 // Decode-only dispatch fusion.  Parameter transforms are independent of the
 // depthwise convolution, and their 48 scalar rows fit inside the convolution's
 // existing grid.  Keeping each expression unchanged preserves the standalone
@@ -341,6 +381,74 @@ kernel void kernel_qwen35_gdn_recurrent(
     const uint qkh = h % args.qk_heads;
     device float *s = state + ((ulong)h * args.state_dim + row) * args.state_dim;
     for (uint token = 0; token < args.n_tokens; token++) {
+        const device float *token_prepared = prepared + token * args.channels;
+        const device float *q = token_prepared + qkh * args.state_dim;
+        const device float *k = token_prepared +
+            (args.qk_heads + qkh) * args.state_dim;
+        const device float *v = token_prepared +
+            2u * args.qk_heads * args.state_dim + h * args.state_dim;
+        const uint param_off = token * args.v_heads + h;
+        const float decay = exp(g[param_off]);
+        float sv[4];
+        float sk = 0.0f;
+        for (uint j = 0; j < 4u; j++) {
+            const uint col = tx * 4u + j;
+            sv[j] = s[col] * decay;
+            sk += sv[j] * k[col];
+        }
+        sk = simd_sum(sk);
+        const float delta = (v[row] - sk) * b[param_off];
+        float y = 0.0f;
+        for (uint j = 0; j < 4u; j++) {
+            const uint col = tx * 4u + j;
+            sv[j] += k[col] * delta;
+            s[col] = sv[j];
+            y += sv[j] * q[col];
+        }
+        y = simd_sum(y);
+        if (tx == 0u) {
+            out[(token * args.v_heads + h) * args.state_dim + row] =
+                y * args.scale;
+        }
+    }
+}
+
+// Recurrent counterpart to kernel_qwen35_gdn_conv_preserve_first. Row zero
+// advances the live state; row one starts from that state but writes its final
+// result to final_state so a verifier rejection requires no target replay.
+kernel void kernel_qwen35_gdn_recurrent_preserve_first(
+        constant ds4_metal_args_qwen35_gdn &args,
+        device const float *prepared,
+        device const float *g,
+        device const float *b,
+        device float *state,
+        device float *middle_state,
+        device float *final_state,
+        device float *out,
+        uint3 tid [[thread_position_in_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    const uint tx = tid.x;
+    const uint ty = tid.y;
+    const uint row = tgpig.x * 4u + ty;
+    const uint h = tgpig.y;
+    if (h >= args.v_heads || row >= args.state_dim ||
+        args.n_tokens < 2u || args.n_tokens > 3u) return;
+    const uint qkh = h % args.qk_heads;
+    const ulong state_base =
+        ((ulong)h * args.state_dim + row) * args.state_dim;
+    device float *first = state + state_base;
+    device float *middle = middle_state + state_base;
+    device float *last = final_state + state_base;
+    for (uint token = 0; token < args.n_tokens; token++) {
+        device float *s = token == 0u ? first :
+            (token + 1u == args.n_tokens ? last : middle);
+        if (token != 0u) {
+            device const float *previous = token == 1u ? first : middle;
+            for (uint j = 0; j < 4u; j++) {
+                const uint col = tx * 4u + j;
+                s[col] = previous[col];
+            }
+        }
         const device float *token_prepared = prepared + token * args.channels;
         const device float *q = token_prepared + qkh * args.state_dim;
         const device float *k = token_prepared +

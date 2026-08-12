@@ -2402,6 +2402,38 @@ int ds4_gpu_qwen35_gdn_batch_tensor(
         uint32_t              conv_width,
         float                 eps);
 
+/* Two-row speculative verifier variant. The live recurrent buffers retain
+ * state after row zero; final_* receive state after row one. */
+int ds4_gpu_qwen35_gdn_batch_preserve_first_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *prepared,
+        ds4_gpu_tensor       *g,
+        ds4_gpu_tensor       *b,
+        ds4_gpu_tensor       *recurrent_out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *ssm_state,
+        ds4_gpu_tensor       *middle_conv_state,
+        ds4_gpu_tensor       *middle_ssm_state,
+        ds4_gpu_tensor       *final_conv_state,
+        ds4_gpu_tensor       *final_ssm_state,
+        const ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *z,
+        const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv_weight_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              a_offset,
+        uint64_t              norm_offset,
+        uint32_t              n_tokens,
+        uint32_t              channels,
+        uint32_t              qk_heads,
+        uint32_t              v_heads,
+        uint32_t              state_dim,
+        uint32_t              conv_width,
+        float                 eps);
+
 /* Extended-WY chunkwise Gated DeltaNet prefill, specialized for chunks of at
  * most 16 tokens and state_dim=128.  The four chunk_* tensors are reusable
  * scratch; values holds the transformed value rows consumed by the output and
