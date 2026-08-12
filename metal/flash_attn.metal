@@ -940,6 +940,7 @@ constant bool FC_flash_attn_ext_vec_has_bias  [[function_constant(FC_FLASH_ATTN_
 constant bool FC_flash_attn_ext_vec_has_scap  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 3)]];
 constant bool FC_flash_attn_ext_vec_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT_VEC + 4)]];
 constant bool FC_flash_attn_ext_vec_shared_kvpad [[function_constant(FC_FLASH_ATTN_EXT_VEC + 5)]];
+constant bool FC_flash_attn_ext_vec_strided_kv [[function_constant(FC_FLASH_ATTN_EXT_VEC + 6)]];
 constant int32_t FC_flash_attn_ext_vec_ns10 [[function_constant(FC_FLASH_ATTN_EXT_VEC + 20)]];
 constant int32_t FC_flash_attn_ext_vec_ns20 [[function_constant(FC_FLASH_ATTN_EXT_VEC + 21)]];
 constant int32_t FC_flash_attn_ext_vec_nsg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 22)]];
@@ -1003,15 +1004,16 @@ kernel void kernel_flash_attn_ext_vec(
     constexpr short NW  = N_SIMDWIDTH;
     constexpr short NL  = NW/NE;
     constexpr short SH  = 4*C;
+    constexpr short QH  = sizeof(q4_t)/sizeof(half4);
 
     static_assert(DK4 % NL == 0, "DK4 must be divisible by NL");
     static_assert(DV4 % NL == 0, "DV4 must be divisible by NL");
 
     threadgroup q4_t  * sq4 = (threadgroup q4_t  *) (shmem_f16 +                      0*PK);
-    threadgroup s_t   * ss  = (threadgroup s_t   *) (shmem_f16 +   sgitg*SH       + NSG*PK);
-    threadgroup s4_t  * ss4 = (threadgroup s4_t  *) (shmem_f16 +   sgitg*SH       + NSG*PK);
-    threadgroup half  * sm  = (threadgroup half  *) (shmem_f16 +   sgitg*SH + 2*C + NSG*PK);
-    threadgroup o4_t  * so4 = (threadgroup o4_t  *) (shmem_f16 + 2*sgitg*PV       + NSG*PK + NSG*SH);
+    threadgroup s_t   * ss  = (threadgroup s_t   *) (shmem_f16 +   sgitg*SH       + NSG*PK*QH);
+    threadgroup s4_t  * ss4 = (threadgroup s4_t  *) (shmem_f16 +   sgitg*SH       + NSG*PK*QH);
+    threadgroup half  * sm  = (threadgroup half  *) (shmem_f16 +   sgitg*SH + 2*C + NSG*PK*QH);
+    threadgroup o4_t  * so4 = (threadgroup o4_t  *) (shmem_f16 + 2*sgitg*PV       + NSG*PK*QH + NSG*SH);
 
     so4 += tiisg;
 
@@ -1123,8 +1125,19 @@ kernel void kernel_flash_attn_ext_vec(
 
                 FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
                     if (is_same<kd4_t, k4_t>::value) {
-                        FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
-                            mqk[cc] += dot((float4) pk4[cc*NE*NS10/4 +  ii*NL], (float4) pq4[ii*NL]);
+                        if (FC_flash_attn_ext_vec_strided_kv) {
+                            device const k4_t *pk4_row =
+                                (device const k4_t *)(k +
+                                    (uint64_t)(ic + NE*cc + ty)*args.nb11);
+                            FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                                mqk[cc] += dot((float4)pk4_row[ii*NL + tx],
+                                               (float4)pq4[ii*NL]);
+                            }
+                        } else {
+                            FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                                mqk[cc] += dot((float4)pk4[cc*NE*NS10/4 + ii*NL],
+                                               (float4)pq4[ii*NL]);
+                            }
                         }
                     } else {
                         device const kd4_t * pk = (device const kd4_t *) (k + ((ic + NE*cc + ty)*args.nb11));
@@ -1215,15 +1228,28 @@ kernel void kernel_flash_attn_ext_vec(
                 }
 
                 if (is_same<vd4_t, v4_t>::value) {
-                    device const v4_t * pv4 = (device const v4_t *) (v + ic*args.nb21);
-
-                    pv4 += ty*NS20/4 + tx;
-
                     const auto sst = ss + ty;
 
-                    FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
-                        FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
-                            lo[ii] += o4_t(float4(pv4[cc*NE*NS20/4 + ii*NL])*float4(sst[cc*NE]));
+                    if (FC_flash_attn_ext_vec_strided_kv) {
+                        FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
+                            device const v4_t *pv4_row =
+                                (device const v4_t *)(v +
+                                    (uint64_t)(ic + NE*cc + ty)*args.nb21);
+                            FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                                lo[ii] += o4_t(float4(pv4_row[ii*NL + tx]) *
+                                               float4(sst[cc*NE]));
+                            }
+                        }
+                    } else {
+                        device const v4_t *pv4 =
+                            (device const v4_t *)(v + ic*args.nb21);
+                        pv4 += ty*NS20/4 + tx;
+                        FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
+                            FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                                lo[ii] += o4_t(float4(
+                                    pv4[cc*NE*NS20/4 + ii*NL]) *
+                                    float4(sst[cc*NE]));
+                            }
                         }
                     }
                 } else {
@@ -1387,8 +1413,24 @@ kernel void kernel_flash_attn_ext_vec(
 
 typedef decltype(kernel_flash_attn_ext_vec<FA_TYPES, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 128, 128, 4>) flash_attn_ext_vec_t;
 
+#define QWEN35_FA_TYPES \
+    float4,        \
+    half4,         \
+    half4,         \
+    float,         \
+    float, float4, \
+           float4
+
+typedef decltype(kernel_flash_attn_ext_vec<QWEN35_FA_TYPES, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 256, 256, 4>) qwen35_flash_attn_ext_vec_t;
+
 // Host-visible decode FlashAttention variant for DS4's 512-wide F16 K/V rows.
 template [[host_name("kernel_flash_attn_ext_vec_f16_dk512_dv512")]]  kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     half4,  1, dequantize_f16_t4, half4,  1, dequantize_f16_t4, 512, 512, 1>;
+
+// Qwen3.6 native-cache decode specialization. Keep Q in F32 to minimize the
+// numerical difference from the legacy two-pass attention implementation.
+template [[host_name("kernel_qwen35_flash_attn_ext_vec_f16_dk256_dv256")]] kernel qwen35_flash_attn_ext_vec_t kernel_flash_attn_ext_vec<QWEN35_FA_TYPES, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 256, 256, 4>;
+
+#undef QWEN35_FA_TYPES
 
 #undef FA_TYPES
 #undef FA_TYPES_F32
@@ -1416,8 +1458,8 @@ static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
 
     device const float  * ss    = (device const float  *) htmp + (uint64_t)args.nrows*DV_*NWG_;
 
-    float S = ss[rid*(2*NWG_) + 2*iwg + 0];
-    float M = ss[rid*(2*NWG_) + 2*iwg + 1];
+    float S = iwg < NWG_ ? ss[rid*(2*NWG_) + 2*iwg + 0] : 0.0f;
+    float M = iwg < NWG_ ? ss[rid*(2*NWG_) + 2*iwg + 1] : -FLT_MAX/2;
 
     const float m  = simd_max(M);
     const float ms = exp(M - m);
@@ -1431,7 +1473,8 @@ static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
     device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
 
     for (short i = sgitg; i < DV4; i += NWG_) {
-        const float4 v = simd_sum(htmp4[i*NWG_ + iwg]*ms);
+        const float4 partial = iwg < NWG_ ? htmp4[i*NWG_ + iwg] : 0.0f;
+        const float4 v = simd_sum(partial*ms);
 
         if (iwg == 0) {
             dst4[i] = v*S;
