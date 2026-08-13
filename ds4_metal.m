@@ -18273,6 +18273,67 @@ int ds4_gpu_matmul_q8_0_tensor(
     return ok;
 }
 
+int ds4_gpu_matmul_q8_0_f16_rhs_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x_f16,
+        uint64_t              n_tok) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !model_map || !x_f16 || n_tok == 0u ||
+        (n_tok % 32u) != 0u || (in_dim % 32u) != 0u ||
+        (out_dim % 64u) != 0u || in_dim > UINT32_MAX ||
+        out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x_f16);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t x_bytes = n_tok*in_dim*sizeof(uint16_t);
+        const uint64_t out_bytes = n_tok*out_dim*sizeof(float);
+        if (!xbuf || !outbuf || ds4_gpu_tensor_bytes(x_f16) < x_bytes ||
+            ds4_gpu_tensor_bytes(out) < out_bytes) return 0;
+
+        const uint64_t row_bytes = (in_dim/32u)*34u;
+        const uint64_t weight_bytes = out_dim*row_bytes;
+        if (weight_offset > model_size ||
+            weight_bytes > model_size - weight_offset) return 0;
+        uint64_t inner_offset = 0u;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(
+            model_map, model_size, weight_offset, weight_bytes, &inner_offset);
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mm_pipeline(
+            "kernel_mul_mm_q8_0_f16_pairs", false, false);
+        if (!wbuf || !pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        ds4_gpu_mul_mm_args args =
+            ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+        args.nb10 = sizeof(uint16_t);
+        args.nb11 = in_dim*sizeof(uint16_t);
+        args.nb12 = in_dim*n_tok*sizeof(uint16_t);
+        args.nb13 = args.nb12;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x_f16) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:4096u + 32u*32u*sizeof(uint16_t)
+                                atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_tok/32u),
+                                              (NSUInteger)(out_dim/64u), 1u)
+             threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(
+            cb, owned, "Q8_0 F16-RHS tensor matmul");
+    }
+}
+
 int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -29229,6 +29290,53 @@ int ds4_gpu_swiglu_tensor(
     return 1;
 }
 
+int ds4_gpu_swiglu_f16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        uint32_t              n,
+        float                 clamp,
+        float                 weight) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !gate || !up || n == 0u || !isfinite(clamp) ||
+        clamp < 0.0f || !isfinite(weight)) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> gatebuf = ds4_gpu_tensor_buffer(gate);
+        id<MTLBuffer> upbuf = ds4_gpu_tensor_buffer(up);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        if (!gatebuf || !upbuf || !outbuf ||
+            ds4_gpu_tensor_bytes(gate) < (uint64_t)n*sizeof(float) ||
+            ds4_gpu_tensor_bytes(up) < (uint64_t)n*sizeof(float) ||
+            ds4_gpu_tensor_bytes(out) < (uint64_t)n*sizeof(uint16_t)) return 0;
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_swiglu_flat_f16");
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        ds4_gpu_glu_args args = {
+            .ne00 = (int32_t)n, .nb01 = (uint64_t)n*sizeof(float),
+            .ne10 = (int32_t)n, .nb11 = (uint64_t)n*sizeof(float),
+            .ne0 = (int32_t)n, .nb1 = (uint64_t)n*sizeof(uint16_t),
+            .i00 = 0, .i10 = 0, .alpha = weight, .limit = clamp,
+        };
+        NSUInteger nth = pipeline.maxTotalThreadsPerThreadgroup;
+        if (nth > 256u) nth = 256u;
+        if (nth > n) nth = n;
+        if (nth == 0u) nth = 1u;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:gatebuf offset:ds4_gpu_tensor_offset(gate) atIndex:1];
+        [enc setBuffer:upbuf offset:ds4_gpu_tensor_offset(up) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n+nth-1u)/nth, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(nth, 1u, 1u)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "SwiGLU F16");
+    }
+}
+
 int ds4_gpu_add_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *a,
@@ -29833,6 +29941,8 @@ static int ds4_gpu_qwen35_gdn_batch_impl(
         ds4_gpu_tensor       *ssm_state,
         ds4_gpu_tensor       *middle_conv_state,
         ds4_gpu_tensor       *middle_ssm_state,
+        ds4_gpu_tensor       *penultimate_conv_state,
+        ds4_gpu_tensor       *penultimate_ssm_state,
         ds4_gpu_tensor       *final_conv_state,
         ds4_gpu_tensor       *final_ssm_state,
         const ds4_gpu_tensor *qkv,
@@ -29856,11 +29966,15 @@ static int ds4_gpu_qwen35_gdn_batch_impl(
         ds4_gpu_tensor       *chunk_u,
         ds4_gpu_tensor       *chunk_qk,
         ds4_gpu_tensor       *chunk_cumulative_g,
-        int                   chunkwise) {
+        int                   chunkwise,
+        uint32_t              row_offset) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    const bool preserve_first =
-        middle_conv_state != NULL || middle_ssm_state != NULL ||
-        final_conv_state != NULL || final_ssm_state != NULL;
+    const bool preserve_four =
+        penultimate_conv_state != NULL || penultimate_ssm_state != NULL;
+    const bool preserve_first = !preserve_four &&
+        (middle_conv_state != NULL || middle_ssm_state != NULL ||
+         final_conv_state != NULL || final_ssm_state != NULL);
+    const bool preserve_state = preserve_first || preserve_four;
     if (!out || !prepared || !g || !b || !recurrent_out || !conv_state ||
         !ssm_state || !qkv || !z || !alpha || !beta || !model_map ||
         n_tokens == 0 || channels == 0 || qk_heads == 0 || v_heads == 0 ||
@@ -29869,10 +29983,28 @@ static int ds4_gpu_qwen35_gdn_batch_impl(
         (preserve_first && (!middle_conv_state || !middle_ssm_state ||
                             !final_conv_state || !final_ssm_state ||
                             n_tokens < 2u || n_tokens > 3u || chunkwise)) ||
-        eps <= 0.0f || (chunkwise &&
-        (n_tokens > 16u || !chunk_w || !chunk_u || !chunk_qk ||
-         !chunk_cumulative_g))) return 0;
+        (preserve_four && (!middle_conv_state || !middle_ssm_state ||
+                           !penultimate_conv_state ||
+                           !penultimate_ssm_state ||
+                           !final_conv_state || !final_ssm_state ||
+                           n_tokens != 4u || chunkwise)) ||
+        eps <= 0.0f) return 0;
+    /* The matrix path consumes complete 8x8 tiles.  Short/ragged tails use
+     * the recurrent kernel transparently; full prefill chunks use WY. */
+    const bool wy_chunkwise = chunkwise && n_tokens >= 16u &&
+        n_tokens <= 64u && (n_tokens & 7u) == 0u &&
+        v_heads == 3u * qk_heads;
+    if (wy_chunkwise &&
+        (!chunk_w || !chunk_u || !chunk_qk || !chunk_cumulative_g)) return 0;
     @autoreleasepool {
+        const uint64_t channels_row_offset =
+            (uint64_t)row_offset * channels * sizeof(float);
+        const uint64_t inner_row_offset =
+            (uint64_t)row_offset * v_heads * state_dim * sizeof(float);
+        const uint64_t param_row_offset =
+            (uint64_t)row_offset * v_heads * sizeof(float);
+        const uint64_t chunk_inner_offset = 0;
+        const uint64_t chunk_param_offset = 0;
         const uint64_t channels_bytes =
             (uint64_t)n_tokens * channels * sizeof(float);
         const uint64_t inner_bytes =
@@ -29886,22 +30018,26 @@ static int ds4_gpu_qwen35_gdn_batch_impl(
         const uint64_t ssm_state_bytes = (uint64_t)v_heads * state_dim * state_dim * sizeof(float);
         const uint64_t conv_weight_bytes = (uint64_t)channels * conv_width * sizeof(float);
         const uint64_t norm_bytes = (uint64_t)state_dim * sizeof(float);
-        if (ds4_gpu_tensor_bytes(prepared) < channels_bytes ||
-            ds4_gpu_tensor_bytes(qkv) < channels_bytes ||
-            ds4_gpu_tensor_bytes(z) < inner_bytes || ds4_gpu_tensor_bytes(out) < inner_bytes ||
-            ds4_gpu_tensor_bytes(recurrent_out) < inner_bytes ||
-            ds4_gpu_tensor_bytes(alpha) < param_rows_bytes ||
-            ds4_gpu_tensor_bytes(beta) < param_rows_bytes ||
-            ds4_gpu_tensor_bytes(g) < param_rows_bytes ||
-            ds4_gpu_tensor_bytes(b) < param_rows_bytes ||
+        if (ds4_gpu_tensor_bytes(prepared) < channels_row_offset + channels_bytes ||
+            ds4_gpu_tensor_bytes(qkv) < channels_row_offset + channels_bytes ||
+            ds4_gpu_tensor_bytes(z) < inner_row_offset + inner_bytes ||
+            ds4_gpu_tensor_bytes(out) < inner_row_offset + inner_bytes ||
+            ds4_gpu_tensor_bytes(recurrent_out) < inner_row_offset + inner_bytes ||
+            ds4_gpu_tensor_bytes(alpha) < param_row_offset + param_rows_bytes ||
+            ds4_gpu_tensor_bytes(beta) < param_row_offset + param_rows_bytes ||
+            ds4_gpu_tensor_bytes(g) < param_row_offset + param_rows_bytes ||
+            ds4_gpu_tensor_bytes(b) < param_row_offset + param_rows_bytes ||
             ds4_gpu_tensor_bytes(conv_state) < conv_state_bytes ||
             ds4_gpu_tensor_bytes(ssm_state) < ssm_state_bytes ||
-            (preserve_first &&
+            (preserve_state &&
              (ds4_gpu_tensor_bytes(middle_conv_state) < conv_state_bytes ||
               ds4_gpu_tensor_bytes(middle_ssm_state) < ssm_state_bytes ||
               ds4_gpu_tensor_bytes(final_conv_state) < conv_state_bytes ||
               ds4_gpu_tensor_bytes(final_ssm_state) < ssm_state_bytes)) ||
-            (chunkwise &&
+            (preserve_four &&
+             (ds4_gpu_tensor_bytes(penultimate_conv_state) < conv_state_bytes ||
+              ds4_gpu_tensor_bytes(penultimate_ssm_state) < ssm_state_bytes)) ||
+            (wy_chunkwise &&
              (ds4_gpu_tensor_bytes(chunk_w) < inner_bytes ||
               ds4_gpu_tensor_bytes(chunk_u) < inner_bytes ||
               ds4_gpu_tensor_bytes(chunk_qk) < chunk_qk_bytes ||
@@ -29925,29 +30061,32 @@ static int ds4_gpu_qwen35_gdn_batch_impl(
             (getenv("DS4_METAL_QWEN_DECODE_FUSIONS") != NULL ||
              getenv("DS4_METAL_QWEN_DECODE_GDN_PARAM_FUSION") != NULL);
         id<MTLComputePipelineState> convp = ds4_gpu_get_pipeline(
+            preserve_four ? "kernel_qwen35_gdn_conv_preserve_four" :
             preserve_first ? "kernel_qwen35_gdn_conv_preserve_first" :
             fused_decode_params ? "kernel_qwen35_gdn_conv_params" :
                                   "kernel_qwen35_gdn_conv");
         id<MTLComputePipelineState> normp = ds4_gpu_get_pipeline("kernel_qwen35_gdn_qk_norm");
         id<MTLComputePipelineState> paramp = fused_decode_params ? nil :
             ds4_gpu_get_pipeline("kernel_qwen35_gdn_params");
-        id<MTLComputePipelineState> recp = chunkwise ? nil :
+        id<MTLComputePipelineState> recp = wy_chunkwise ? nil :
             ds4_gpu_get_pipeline(preserve_first ?
                 "kernel_qwen35_gdn_recurrent_preserve_first" :
+                preserve_four ? "kernel_qwen35_gdn_recurrent_preserve_four" :
                 "kernel_qwen35_gdn_recurrent");
-        id<MTLComputePipelineState> chunk_preparep = chunkwise ?
-            ds4_gpu_get_pipeline("kernel_qwen35_gdn_chunk_prepare") : nil;
-        id<MTLComputePipelineState> chunk_valuesp = chunkwise ?
-            ds4_gpu_get_pipeline("kernel_qwen35_gdn_chunk_values") : nil;
-        id<MTLComputePipelineState> chunk_outputp = chunkwise ?
-            ds4_gpu_get_pipeline("kernel_qwen35_gdn_chunk_output") : nil;
-        id<MTLComputePipelineState> chunk_statep = chunkwise ?
-            ds4_gpu_get_pipeline("kernel_qwen35_gdn_chunk_state") : nil;
+        id<MTLComputePipelineState> wy_packp = wy_chunkwise ?
+            ds4_gpu_get_pipeline("kernel_qwen35_gdn_wy_pack") : nil;
+        id<MTLComputePipelineState> wy_kkt_qkp = wy_chunkwise ?
+            ds4_gpu_get_pipeline("kernel_qwen35_gdn_wy_kkt_qk_raw") : nil;
+        id<MTLComputePipelineState> wy_solvep = wy_chunkwise ?
+            ds4_gpu_get_pipeline("kernel_qwen35_gdn_wy_solve") : nil;
+        id<MTLComputePipelineState> wy_valuesp = wy_chunkwise ?
+            ds4_gpu_get_pipeline("kernel_qwen35_gdn_wy_values_output_32") : nil;
         id<MTLComputePipelineState> postp = ds4_gpu_get_pipeline("kernel_qwen35_gdn_post");
         if (!convbuf || !dtbuf || !abuf || !normbuf || !convp || !normp ||
-            (!fused_decode_params && !paramp) || !postp || (!chunkwise && !recp) ||
-            (chunkwise && (!chunk_preparep || !chunk_valuesp ||
-                           !chunk_outputp || !chunk_statep))) return 0;
+            (!fused_decode_params && !paramp) || !postp ||
+            (!wy_chunkwise && !recp) ||
+            (wy_chunkwise && (!wy_packp || !wy_kkt_qkp ||
+                              !wy_solvep || !wy_valuesp))) return 0;
         ds4_gpu_qwen35_gdn_args args = {
             .n_tokens = n_tokens, .channels = channels,
             .qk_heads = qk_heads, .v_heads = v_heads,
@@ -29960,27 +30099,41 @@ static int ds4_gpu_qwen35_gdn_batch_impl(
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:convp];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
-        [enc setBuffer:ds4_gpu_tensor_buffer(qkv) offset:ds4_gpu_tensor_offset(qkv) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(qkv)
+                offset:ds4_gpu_tensor_offset(qkv) + channels_row_offset atIndex:1];
         [enc setBuffer:convbuf offset:(NSUInteger)conv_inner atIndex:2];
         [enc setBuffer:ds4_gpu_tensor_buffer(conv_state) offset:ds4_gpu_tensor_offset(conv_state) atIndex:3];
-        if (preserve_first) {
+        if (preserve_state) {
             [enc setBuffer:ds4_gpu_tensor_buffer(middle_conv_state)
                     offset:ds4_gpu_tensor_offset(middle_conv_state) atIndex:4];
-            [enc setBuffer:ds4_gpu_tensor_buffer(final_conv_state)
-                    offset:ds4_gpu_tensor_offset(final_conv_state) atIndex:5];
-            [enc setBuffer:ds4_gpu_tensor_buffer(prepared)
-                    offset:ds4_gpu_tensor_offset(prepared) atIndex:6];
+            if (preserve_four) {
+                [enc setBuffer:ds4_gpu_tensor_buffer(penultimate_conv_state)
+                        offset:ds4_gpu_tensor_offset(penultimate_conv_state) atIndex:5];
+                [enc setBuffer:ds4_gpu_tensor_buffer(final_conv_state)
+                        offset:ds4_gpu_tensor_offset(final_conv_state) atIndex:6];
+                [enc setBuffer:ds4_gpu_tensor_buffer(prepared)
+                        offset:ds4_gpu_tensor_offset(prepared) atIndex:7];
+            } else {
+                [enc setBuffer:ds4_gpu_tensor_buffer(final_conv_state)
+                        offset:ds4_gpu_tensor_offset(final_conv_state) atIndex:5];
+                [enc setBuffer:ds4_gpu_tensor_buffer(prepared)
+                        offset:ds4_gpu_tensor_offset(prepared) atIndex:6];
+            }
         } else {
             [enc setBuffer:ds4_gpu_tensor_buffer(prepared)
-                    offset:ds4_gpu_tensor_offset(prepared) atIndex:4];
+                    offset:ds4_gpu_tensor_offset(prepared) + channels_row_offset atIndex:4];
         }
         if (fused_decode_params) {
-            [enc setBuffer:ds4_gpu_tensor_buffer(alpha) offset:ds4_gpu_tensor_offset(alpha) atIndex:5];
-            [enc setBuffer:ds4_gpu_tensor_buffer(beta) offset:ds4_gpu_tensor_offset(beta) atIndex:6];
+            [enc setBuffer:ds4_gpu_tensor_buffer(alpha)
+                    offset:ds4_gpu_tensor_offset(alpha) + param_row_offset atIndex:5];
+            [enc setBuffer:ds4_gpu_tensor_buffer(beta)
+                    offset:ds4_gpu_tensor_offset(beta) + param_row_offset atIndex:6];
             [enc setBuffer:dtbuf offset:(NSUInteger)dt_inner atIndex:7];
             [enc setBuffer:abuf offset:(NSUInteger)a_inner atIndex:8];
-            [enc setBuffer:ds4_gpu_tensor_buffer(g) offset:ds4_gpu_tensor_offset(g) atIndex:9];
-            [enc setBuffer:ds4_gpu_tensor_buffer(b) offset:ds4_gpu_tensor_offset(b) atIndex:10];
+            [enc setBuffer:ds4_gpu_tensor_buffer(g)
+                    offset:ds4_gpu_tensor_offset(g) + param_row_offset atIndex:9];
+            [enc setBuffer:ds4_gpu_tensor_buffer(b)
+                    offset:ds4_gpu_tensor_offset(b) + param_row_offset atIndex:10];
         }
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)channels + 255u) / 256u, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -29989,7 +30142,8 @@ static int ds4_gpu_qwen35_gdn_batch_impl(
         enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:normp];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
-        [enc setBuffer:ds4_gpu_tensor_buffer(prepared) offset:ds4_gpu_tensor_offset(prepared) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(prepared)
+                offset:ds4_gpu_tensor_offset(prepared) + channels_row_offset atIndex:1];
         [enc setThreadgroupMemoryLength:(NSUInteger)state_dim * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(2u * qk_heads, n_tokens, 1)
              threadsPerThreadgroup:MTLSizeMake(state_dim, 1, 1)];
@@ -29999,12 +30153,16 @@ static int ds4_gpu_qwen35_gdn_batch_impl(
             enc = ds4_gpu_compute_encoder(cb);
             [enc setComputePipelineState:paramp];
             [enc setBytes:&args length:sizeof(args) atIndex:0];
-            [enc setBuffer:ds4_gpu_tensor_buffer(alpha) offset:ds4_gpu_tensor_offset(alpha) atIndex:1];
-            [enc setBuffer:ds4_gpu_tensor_buffer(beta) offset:ds4_gpu_tensor_offset(beta) atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(alpha)
+                    offset:ds4_gpu_tensor_offset(alpha) + param_row_offset atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(beta)
+                    offset:ds4_gpu_tensor_offset(beta) + param_row_offset atIndex:2];
             [enc setBuffer:dtbuf offset:(NSUInteger)dt_inner atIndex:3];
             [enc setBuffer:abuf offset:(NSUInteger)a_inner atIndex:4];
-            [enc setBuffer:ds4_gpu_tensor_buffer(g) offset:ds4_gpu_tensor_offset(g) atIndex:5];
-            [enc setBuffer:ds4_gpu_tensor_buffer(b) offset:ds4_gpu_tensor_offset(b) atIndex:6];
+            [enc setBuffer:ds4_gpu_tensor_buffer(g)
+                    offset:ds4_gpu_tensor_offset(g) + param_row_offset atIndex:5];
+            [enc setBuffer:ds4_gpu_tensor_buffer(b)
+                    offset:ds4_gpu_tensor_offset(b) + param_row_offset atIndex:6];
             const NSUInteger param_total = (NSUInteger)n_tokens * v_heads;
             const NSUInteger param_threads = n_tokens == 1u ? v_heads : 256u;
             [enc dispatchThreadgroups:MTLSizeMake(
@@ -30013,93 +30171,132 @@ static int ds4_gpu_qwen35_gdn_batch_impl(
             ds4_gpu_end_compute_encoder(cb, enc);
         }
 
-        if (!chunkwise) {
+        if (!wy_chunkwise) {
             enc = ds4_gpu_compute_encoder(cb);
             [enc setComputePipelineState:recp];
             [enc setBytes:&args length:sizeof(args) atIndex:0];
-            [enc setBuffer:ds4_gpu_tensor_buffer(prepared) offset:ds4_gpu_tensor_offset(prepared) atIndex:1];
-            [enc setBuffer:ds4_gpu_tensor_buffer(g) offset:ds4_gpu_tensor_offset(g) atIndex:2];
-            [enc setBuffer:ds4_gpu_tensor_buffer(b) offset:ds4_gpu_tensor_offset(b) atIndex:3];
+            [enc setBuffer:ds4_gpu_tensor_buffer(prepared)
+                    offset:ds4_gpu_tensor_offset(prepared) + channels_row_offset atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(g)
+                    offset:ds4_gpu_tensor_offset(g) + param_row_offset atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(b)
+                    offset:ds4_gpu_tensor_offset(b) + param_row_offset atIndex:3];
             [enc setBuffer:ds4_gpu_tensor_buffer(ssm_state) offset:ds4_gpu_tensor_offset(ssm_state) atIndex:4];
-            if (preserve_first) {
+            if (preserve_state) {
                 [enc setBuffer:ds4_gpu_tensor_buffer(middle_ssm_state)
                         offset:ds4_gpu_tensor_offset(middle_ssm_state) atIndex:5];
-                [enc setBuffer:ds4_gpu_tensor_buffer(final_ssm_state)
-                        offset:ds4_gpu_tensor_offset(final_ssm_state) atIndex:6];
-                [enc setBuffer:ds4_gpu_tensor_buffer(recurrent_out)
-                        offset:ds4_gpu_tensor_offset(recurrent_out) atIndex:7];
+                if (preserve_four) {
+                    [enc setBuffer:ds4_gpu_tensor_buffer(penultimate_ssm_state)
+                            offset:ds4_gpu_tensor_offset(penultimate_ssm_state) atIndex:6];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(final_ssm_state)
+                            offset:ds4_gpu_tensor_offset(final_ssm_state) atIndex:7];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(recurrent_out)
+                            offset:ds4_gpu_tensor_offset(recurrent_out) atIndex:8];
+                } else {
+                    [enc setBuffer:ds4_gpu_tensor_buffer(final_ssm_state)
+                            offset:ds4_gpu_tensor_offset(final_ssm_state) atIndex:6];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(recurrent_out)
+                            offset:ds4_gpu_tensor_offset(recurrent_out) atIndex:7];
+                }
             } else {
                 [enc setBuffer:ds4_gpu_tensor_buffer(recurrent_out)
-                        offset:ds4_gpu_tensor_offset(recurrent_out) atIndex:5];
+                        offset:ds4_gpu_tensor_offset(recurrent_out) +
+                               inner_row_offset atIndex:5];
             }
             [enc dispatchThreadgroups:MTLSizeMake(state_dim / 4u, v_heads, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
         } else {
-            const NSUInteger inner_total = (NSUInteger)n_tokens * v_heads * state_dim;
-            const NSUInteger state_total = (NSUInteger)v_heads * state_dim * state_dim;
-
+            const NSUInteger tiles = n_tokens / 8u;
             enc = ds4_gpu_compute_encoder(cb);
-            [enc setComputePipelineState:chunk_preparep];
+            [enc setComputePipelineState:wy_packp];
             [enc setBytes:&args length:sizeof(args) atIndex:0];
-            [enc setBuffer:ds4_gpu_tensor_buffer(prepared) offset:ds4_gpu_tensor_offset(prepared) atIndex:1];
-            [enc setBuffer:ds4_gpu_tensor_buffer(g) offset:ds4_gpu_tensor_offset(g) atIndex:2];
-            [enc setBuffer:ds4_gpu_tensor_buffer(b) offset:ds4_gpu_tensor_offset(b) atIndex:3];
-            [enc setBuffer:ds4_gpu_tensor_buffer(chunk_w) offset:ds4_gpu_tensor_offset(chunk_w) atIndex:4];
-            [enc setBuffer:ds4_gpu_tensor_buffer(chunk_u) offset:ds4_gpu_tensor_offset(chunk_u) atIndex:5];
-            [enc setBuffer:ds4_gpu_tensor_buffer(chunk_qk) offset:ds4_gpu_tensor_offset(chunk_qk) atIndex:6];
-            [enc setBuffer:ds4_gpu_tensor_buffer(chunk_cumulative_g) offset:ds4_gpu_tensor_offset(chunk_cumulative_g) atIndex:7];
-            [enc setThreadgroupMemoryLength:(16u + 16u * 16u) * sizeof(float) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(prepared)
+                    offset:ds4_gpu_tensor_offset(prepared) + channels_row_offset atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(g)
+                    offset:ds4_gpu_tensor_offset(g) + param_row_offset atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(b)
+                    offset:ds4_gpu_tensor_offset(b) + param_row_offset atIndex:3];
+            [enc setBuffer:ds4_gpu_tensor_buffer(chunk_w)
+                    offset:ds4_gpu_tensor_offset(chunk_w) + chunk_inner_offset atIndex:4];
+            [enc setBuffer:ds4_gpu_tensor_buffer(chunk_u)
+                    offset:ds4_gpu_tensor_offset(chunk_u) + chunk_inner_offset atIndex:5];
+            [enc setBuffer:ds4_gpu_tensor_buffer(chunk_cumulative_g)
+                    offset:ds4_gpu_tensor_offset(chunk_cumulative_g) + chunk_param_offset atIndex:6];
+            [enc setThreadgroupMemoryLength:(NSUInteger)n_tokens * sizeof(float) atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake(v_heads, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-            ds4_gpu_end_compute_encoder(cb, enc);
-
-            enc = ds4_gpu_compute_encoder(cb);
-            [enc setComputePipelineState:chunk_valuesp];
-            [enc setBytes:&args length:sizeof(args) atIndex:0];
-            [enc setBuffer:ds4_gpu_tensor_buffer(chunk_w) offset:ds4_gpu_tensor_offset(chunk_w) atIndex:1];
-            [enc setBuffer:ds4_gpu_tensor_buffer(chunk_u) offset:ds4_gpu_tensor_offset(chunk_u) atIndex:2];
-            [enc setBuffer:ds4_gpu_tensor_buffer(ssm_state) offset:ds4_gpu_tensor_offset(ssm_state) atIndex:3];
-            [enc setBuffer:ds4_gpu_tensor_buffer(recurrent_out) offset:ds4_gpu_tensor_offset(recurrent_out) atIndex:4];
-            [enc dispatchThreadgroups:MTLSizeMake((inner_total + 255u) / 256u, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
 
-            // Output must observe the incoming state; update it only after all
-            // token outputs have been formed.
             enc = ds4_gpu_compute_encoder(cb);
-            [enc setComputePipelineState:chunk_outputp];
+            [enc setComputePipelineState:wy_kkt_qkp];
             [enc setBytes:&args length:sizeof(args) atIndex:0];
-            [enc setBuffer:ds4_gpu_tensor_buffer(prepared) offset:ds4_gpu_tensor_offset(prepared) atIndex:1];
-            [enc setBuffer:ds4_gpu_tensor_buffer(chunk_qk) offset:ds4_gpu_tensor_offset(chunk_qk) atIndex:2];
-            [enc setBuffer:ds4_gpu_tensor_buffer(chunk_cumulative_g) offset:ds4_gpu_tensor_offset(chunk_cumulative_g) atIndex:3];
+            [enc setBuffer:ds4_gpu_tensor_buffer(chunk_u)
+                    offset:ds4_gpu_tensor_offset(chunk_u) + chunk_inner_offset atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(recurrent_out)
+                    offset:ds4_gpu_tensor_offset(recurrent_out) + inner_row_offset atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(tiles * (tiles + 1u) / 2u,
+                                                  1u, qk_heads)
+                 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+
+            enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:wy_solvep];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(b)
+                    offset:ds4_gpu_tensor_offset(b) + param_row_offset atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(chunk_cumulative_g)
+                    offset:ds4_gpu_tensor_offset(chunk_cumulative_g) + chunk_param_offset atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(chunk_qk) offset:ds4_gpu_tensor_offset(chunk_qk) atIndex:3];
+            [enc setBuffer:ds4_gpu_tensor_buffer(recurrent_out)
+                    offset:ds4_gpu_tensor_offset(recurrent_out) + inner_row_offset atIndex:4];
+            const NSUInteger solve_simdgroups = 8u;
+            const NSUInteger solve_bytes =
+                (2u * (NSUInteger)n_tokens * n_tokens +
+                 solve_simdgroups * 64u) * sizeof(uint16_t) +
+                solve_simdgroups * 64u * sizeof(float);
+            [enc setThreadgroupMemoryLength:solve_bytes atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(v_heads, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(solve_simdgroups * 32u, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+
+            enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:wy_valuesp];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(chunk_qk) offset:ds4_gpu_tensor_offset(chunk_qk) atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(chunk_w)
+                    offset:ds4_gpu_tensor_offset(chunk_w) + chunk_inner_offset atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(chunk_u)
+                    offset:ds4_gpu_tensor_offset(chunk_u) + chunk_inner_offset atIndex:3];
             [enc setBuffer:ds4_gpu_tensor_buffer(ssm_state) offset:ds4_gpu_tensor_offset(ssm_state) atIndex:4];
-            [enc setBuffer:ds4_gpu_tensor_buffer(recurrent_out) offset:ds4_gpu_tensor_offset(recurrent_out) atIndex:5];
-            [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:6];
-            [enc dispatchThreadgroups:MTLSizeMake((inner_total + 255u) / 256u, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            ds4_gpu_end_compute_encoder(cb, enc);
-
-            enc = ds4_gpu_compute_encoder(cb);
-            [enc setComputePipelineState:chunk_statep];
-            [enc setBytes:&args length:sizeof(args) atIndex:0];
-            [enc setBuffer:ds4_gpu_tensor_buffer(prepared) offset:ds4_gpu_tensor_offset(prepared) atIndex:1];
-            [enc setBuffer:ds4_gpu_tensor_buffer(chunk_cumulative_g) offset:ds4_gpu_tensor_offset(chunk_cumulative_g) atIndex:2];
-            [enc setBuffer:ds4_gpu_tensor_buffer(recurrent_out) offset:ds4_gpu_tensor_offset(recurrent_out) atIndex:3];
-            [enc setBuffer:ds4_gpu_tensor_buffer(ssm_state) offset:ds4_gpu_tensor_offset(ssm_state) atIndex:4];
-            [enc dispatchThreadgroups:MTLSizeMake((state_total + 255u) / 256u, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc setBuffer:ds4_gpu_tensor_buffer(recurrent_out)
+                    offset:ds4_gpu_tensor_offset(recurrent_out) + inner_row_offset atIndex:5];
+            [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                    offset:ds4_gpu_tensor_offset(out) + inner_row_offset atIndex:6];
+            [enc setBuffer:ds4_gpu_tensor_buffer(chunk_cumulative_g)
+                    offset:ds4_gpu_tensor_offset(chunk_cumulative_g) + chunk_param_offset atIndex:7];
+            const NSUInteger direct_value_bytes =
+                MAX(8u * 32u, (NSUInteger)n_tokens * 8u) *
+                    sizeof(uint16_t) +
+                (NSUInteger)n_tokens * 32u *
+                    (sizeof(float) + sizeof(uint16_t));
+            [enc setThreadgroupMemoryLength:direct_value_bytes atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(state_dim / 32u, v_heads, 1)
+                 threadsPerThreadgroup:MTLSizeMake(tiles * 32u, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
         }
 
         enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:postp];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
-        [enc setBuffer:ds4_gpu_tensor_buffer(chunkwise ? out : recurrent_out)
-                offset:ds4_gpu_tensor_offset(chunkwise ? out : recurrent_out) atIndex:1];
-        [enc setBuffer:ds4_gpu_tensor_buffer(z) offset:ds4_gpu_tensor_offset(z) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(wy_chunkwise ? out : recurrent_out)
+                offset:ds4_gpu_tensor_offset(wy_chunkwise ? out : recurrent_out) +
+                       inner_row_offset atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(z)
+                offset:ds4_gpu_tensor_offset(z) + inner_row_offset atIndex:2];
         [enc setBuffer:normbuf offset:(NSUInteger)norm_inner atIndex:3];
-        [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:ds4_gpu_tensor_offset(out) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) + inner_row_offset atIndex:4];
         [enc setThreadgroupMemoryLength:(NSUInteger)state_dim * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(v_heads, n_tokens, 1)
              threadsPerThreadgroup:MTLSizeMake(state_dim, 1, 1)];
@@ -30135,11 +30332,11 @@ int ds4_gpu_qwen35_gdn_batch_tensor(
         float                 eps) {
     return ds4_gpu_qwen35_gdn_batch_impl(
         out, prepared, g, b, recurrent_out, conv_state, ssm_state,
-        NULL, NULL, NULL, NULL,
+        NULL, NULL, NULL, NULL, NULL, NULL,
         qkv, z, alpha, beta, model_map, model_size,
         conv_weight_offset, dt_bias_offset, a_offset, norm_offset,
         n_tokens, channels, qk_heads, v_heads, state_dim, conv_width, eps,
-        NULL, NULL, NULL, NULL, 0);
+        NULL, NULL, NULL, NULL, 0, 0u);
 }
 
 int ds4_gpu_qwen35_gdn_batch_preserve_first_tensor(
@@ -30174,11 +30371,41 @@ int ds4_gpu_qwen35_gdn_batch_preserve_first_tensor(
     return ds4_gpu_qwen35_gdn_batch_impl(
         out, prepared, g, b, recurrent_out, conv_state, ssm_state,
         middle_conv_state, middle_ssm_state,
+        NULL, NULL,
         final_conv_state, final_ssm_state,
         qkv, z, alpha, beta, model_map, model_size,
         conv_weight_offset, dt_bias_offset, a_offset, norm_offset,
         n_tokens, channels, qk_heads, v_heads, state_dim, conv_width, eps,
-        NULL, NULL, NULL, NULL, 0);
+        NULL, NULL, NULL, NULL, 0, 0u);
+}
+
+int ds4_gpu_qwen35_gdn_batch_preserve_four_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *prepared,
+        ds4_gpu_tensor *g, ds4_gpu_tensor *b,
+        ds4_gpu_tensor *recurrent_out,
+        ds4_gpu_tensor *conv_state, ds4_gpu_tensor *ssm_state,
+        ds4_gpu_tensor *middle_conv_state,
+        ds4_gpu_tensor *middle_ssm_state,
+        ds4_gpu_tensor *penultimate_conv_state,
+        ds4_gpu_tensor *penultimate_ssm_state,
+        ds4_gpu_tensor *final_conv_state,
+        ds4_gpu_tensor *final_ssm_state,
+        const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *z,
+        const ds4_gpu_tensor *alpha, const ds4_gpu_tensor *beta,
+        const void *model_map, uint64_t model_size,
+        uint64_t conv_weight_offset, uint64_t dt_bias_offset,
+        uint64_t a_offset, uint64_t norm_offset,
+        uint32_t channels, uint32_t qk_heads, uint32_t v_heads,
+        uint32_t state_dim, uint32_t conv_width, float eps) {
+    return ds4_gpu_qwen35_gdn_batch_impl(
+        out, prepared, g, b, recurrent_out, conv_state, ssm_state,
+        middle_conv_state, middle_ssm_state,
+        penultimate_conv_state, penultimate_ssm_state,
+        final_conv_state, final_ssm_state,
+        qkv, z, alpha, beta, model_map, model_size,
+        conv_weight_offset, dt_bias_offset, a_offset, norm_offset,
+        4u, channels, qk_heads, v_heads, state_dim, conv_width, eps,
+        NULL, NULL, NULL, NULL, 0, 0u);
 }
 
 int ds4_gpu_qwen35_gdn_chunk_tensor(
@@ -30212,11 +30439,85 @@ int ds4_gpu_qwen35_gdn_chunk_tensor(
         float                 eps) {
     return ds4_gpu_qwen35_gdn_batch_impl(
         out, prepared, g, b, values, conv_state, ssm_state,
-        NULL, NULL, NULL, NULL,
+        NULL, NULL, NULL, NULL, NULL, NULL,
         qkv, z, alpha, beta, model_map, model_size,
         conv_weight_offset, dt_bias_offset, a_offset, norm_offset,
         n_tokens, channels, qk_heads, v_heads, state_dim, conv_width, eps,
-        chunk_w, chunk_u, chunk_qk, chunk_cumulative_g, 1);
+        chunk_w, chunk_u, chunk_qk, chunk_cumulative_g, 1, 0u);
+}
+
+int ds4_gpu_qwen35_gdn_chunk_offset_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *prepared,
+        ds4_gpu_tensor       *g,
+        ds4_gpu_tensor       *b,
+        ds4_gpu_tensor       *values,
+        ds4_gpu_tensor       *chunk_w,
+        ds4_gpu_tensor       *chunk_u,
+        ds4_gpu_tensor       *chunk_qk,
+        ds4_gpu_tensor       *chunk_cumulative_g,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *ssm_state,
+        const ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *z,
+        const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv_weight_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              a_offset,
+        uint64_t              norm_offset,
+        uint32_t              row_offset,
+        uint32_t              n_tokens,
+        uint32_t              channels,
+        uint32_t              qk_heads,
+        uint32_t              v_heads,
+        uint32_t              state_dim,
+        uint32_t              conv_width,
+        float                 eps) {
+    return ds4_gpu_qwen35_gdn_batch_impl(
+        out, prepared, g, b, values, conv_state, ssm_state,
+        NULL, NULL, NULL, NULL, NULL, NULL,
+        qkv, z, alpha, beta, model_map, model_size,
+        conv_weight_offset, dt_bias_offset, a_offset, norm_offset,
+        n_tokens, channels, qk_heads, v_heads, state_dim, conv_width, eps,
+        chunk_w, chunk_u, chunk_qk, chunk_cumulative_g, 1, row_offset);
+}
+
+int ds4_gpu_qwen35_gdn_batch_offset_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *prepared,
+        ds4_gpu_tensor       *g,
+        ds4_gpu_tensor       *b,
+        ds4_gpu_tensor       *values,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *ssm_state,
+        const ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *z,
+        const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv_weight_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              a_offset,
+        uint64_t              norm_offset,
+        uint32_t              row_offset,
+        uint32_t              n_tokens,
+        uint32_t              channels,
+        uint32_t              qk_heads,
+        uint32_t              v_heads,
+        uint32_t              state_dim,
+        uint32_t              conv_width,
+        float                 eps) {
+    return ds4_gpu_qwen35_gdn_batch_impl(
+        out, prepared, g, b, values, conv_state, ssm_state,
+        NULL, NULL, NULL, NULL, NULL, NULL,
+        qkv, z, alpha, beta, model_map, model_size,
+        conv_weight_offset, dt_bias_offset, a_offset, norm_offset,
+        n_tokens, channels, qk_heads, v_heads, state_dim, conv_width, eps,
+        NULL, NULL, NULL, NULL, 0, row_offset);
 }
 
 int ds4_gpu_directional_steering_project_tensor(

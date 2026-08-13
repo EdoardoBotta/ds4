@@ -105,6 +105,7 @@ static ds4_engine *test_open_engine(bool quality) {
     ds4_engine_options opt = {
         .model_path = test_model_path(),
         .backend = test_model_backend(),
+        .context_size = 512,
         .quality = quality,
         .ssd_streaming = test_env_bool("DS4_TEST_SSD_STREAMING"),
         .ssd_streaming_cold = test_env_bool("DS4_TEST_SSD_STREAMING_COLD"),
@@ -383,9 +384,16 @@ static void test_qwen_gdn_chunkwise_math(void) {
 #if defined(__APPLE__)
 static void test_metal_qwen_gdn_chunkwise_equivalence(void) {
     enum {
-        N = 16, D = 128, QH = 1, VH = 1,
+        MAX_N = 64, D = 128, QH = 16, VH = 48,
         CHANNELS = (2 * QH + VH) * D, CONV = 2,
     };
+    const char *n_env = getenv("DS4_TEST_QWEN_GDN_N");
+    const uint32_t N = n_env ? (uint32_t)strtoul(n_env, NULL, 10) : MAX_N;
+    if (N < 16u || N > 64u || (N & 7u) != 0u) {
+        fprintf(stderr, "ds4-test: unsupported Qwen GDN test chunk %u\n", N);
+        test_failures++;
+        return;
+    }
     if (!ds4_gpu_init()) {
         fprintf(stderr, "ds4-test: Qwen GDN Metal comparison skipped (no Metal device)\n");
         return;
@@ -453,8 +461,12 @@ static void test_metal_qwen_gdn_chunkwise_equivalence(void) {
             (float)((int)((ch * 7u) % 11u) - 5) / 80.0f;
         conv_weight[ch * CONV + 1u] = 0.85f + 0.01f * (float)(ch % 5u);
     }
-    ((float *)((uint8_t *)model_raw + dt_offset))[0] = -0.25f;
-    ((float *)((uint8_t *)model_raw + a_offset))[0] = -0.12f;
+    for (uint32_t h = 0; h < VH; h++) {
+        ((float *)((uint8_t *)model_raw + dt_offset))[h] =
+            -0.25f + 0.002f * (float)(h % 7u);
+        ((float *)((uint8_t *)model_raw + a_offset))[h] =
+            -0.12f - 0.001f * (float)(h % 11u);
+    }
     float *norm = (float *)((uint8_t *)model_raw + norm_offset);
     for (uint32_t d = 0; d < D; d++) norm[d] = 0.9f + 0.002f * (float)(d % 17u);
 
@@ -513,6 +525,204 @@ static void test_metal_qwen_gdn_chunkwise_equivalence(void) {
     TEST_ASSERT(out_finite && state_finite);
     TEST_ASSERT(out_err < 2.0e-3f);
     TEST_ASSERT(state_err < 2.0e-3f);
+
+    /* Exercise the offset-aware binding used when a wide projection batch is
+     * consumed as consecutive 64-row WY blocks. Prefix rows are sent first so
+     * both paths reach the same recurrent frontier before the offset slice. */
+    if (N == 64u) {
+        enum { OFFSET_N = 128 };
+        const uint64_t offset_qkv_bytes =
+            (uint64_t)OFFSET_N * CHANNELS * sizeof(float);
+        const uint64_t offset_inner_bytes =
+            (uint64_t)OFFSET_N * VH * D * sizeof(float);
+        const uint64_t offset_param_bytes =
+            (uint64_t)OFFSET_N * VH * sizeof(float);
+        float *qkv_offset_host = malloc((size_t)offset_qkv_bytes);
+        float *z_offset_host = malloc((size_t)offset_inner_bytes);
+        float *alpha_offset_host = malloc((size_t)offset_param_bytes);
+        float *beta_offset_host = malloc((size_t)offset_param_bytes);
+        float *out_offset_host = malloc((size_t)offset_inner_bytes);
+        float *conv_frontier = malloc((size_t)conv_state_bytes);
+        float *state_frontier = malloc((size_t)state_bytes);
+        ds4_gpu_tensor *out_offset = ds4_gpu_tensor_alloc(offset_inner_bytes);
+        ds4_gpu_tensor *prepared_offset = ds4_gpu_tensor_alloc(offset_qkv_bytes);
+        ds4_gpu_tensor *g_offset = ds4_gpu_tensor_alloc(offset_param_bytes);
+        ds4_gpu_tensor *b_offset = ds4_gpu_tensor_alloc(offset_param_bytes);
+        ds4_gpu_tensor *work_offset = ds4_gpu_tensor_alloc(offset_inner_bytes);
+        ds4_gpu_tensor *w_offset = ds4_gpu_tensor_alloc(inner_bytes);
+        ds4_gpu_tensor *u_offset = ds4_gpu_tensor_alloc(inner_bytes);
+        ds4_gpu_tensor *cumulative_offset =
+            ds4_gpu_tensor_alloc(param_bytes);
+        ds4_gpu_tensor *qkv_offset = ds4_gpu_tensor_alloc(offset_qkv_bytes);
+        ds4_gpu_tensor *z_offset = ds4_gpu_tensor_alloc(offset_inner_bytes);
+        ds4_gpu_tensor *alpha_offset = ds4_gpu_tensor_alloc(offset_param_bytes);
+        ds4_gpu_tensor *beta_offset = ds4_gpu_tensor_alloc(offset_param_bytes);
+        ds4_gpu_tensor *conv_offset = ds4_gpu_tensor_alloc(conv_state_bytes);
+        ds4_gpu_tensor *state_offset = ds4_gpu_tensor_alloc(state_bytes);
+        const bool offset_allocated = qkv_offset_host && z_offset_host &&
+            alpha_offset_host && beta_offset_host && out_offset_host &&
+            conv_frontier && state_frontier &&
+            out_offset && prepared_offset && g_offset && b_offset &&
+            work_offset && w_offset && u_offset && cumulative_offset &&
+            qkv_offset && z_offset && alpha_offset && beta_offset &&
+            conv_offset && state_offset;
+        TEST_ASSERT(offset_allocated);
+        if (offset_allocated) {
+            for (uint32_t i = 0; i < OFFSET_N * CHANNELS; i++) {
+                qkv_offset_host[i] =
+                    (float)((int)((i * 29u + 7u) % 59u) - 29) / 97.0f;
+            }
+            for (uint32_t i = 0; i < OFFSET_N * VH * D; i++) {
+                z_offset_host[i] =
+                    (float)((int)((i * 11u + 3u) % 37u) - 18) / 31.0f;
+            }
+            for (uint32_t i = 0; i < OFFSET_N * VH; i++) {
+                alpha_offset_host[i] = -0.8f + 0.03f * (float)(i % 9u);
+                beta_offset_host[i] = -0.4f + 0.08f * (float)(i % 11u);
+            }
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                qkv_offset, 0, qkv_offset_host, offset_qkv_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                z_offset, 0, z_offset_host, offset_inner_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                alpha_offset, 0, alpha_offset_host, offset_param_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                beta_offset, 0, beta_offset_host, offset_param_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                conv_offset, 0, conv_host, conv_state_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                state_offset, 0, state_host, state_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_qwen35_gdn_chunk_offset_tensor(
+                out_offset, prepared_offset, g_offset, b_offset, work_offset,
+                w_offset, u_offset, chunk_qk, cumulative_offset,
+                conv_offset, state_offset, qkv_offset, z_offset,
+                alpha_offset, beta_offset, model_raw, model_bytes,
+                conv_weight_offset, dt_offset, a_offset, norm_offset,
+                0u, N, CHANNELS, QH, VH, D, CONV, 1.0e-6f) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(
+                conv_offset, 0, conv_frontier, conv_state_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(
+                state_offset, 0, state_frontier, state_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                qkv, 0, qkv_offset_host + (uint64_t)N * CHANNELS,
+                qkv_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                z, 0, z_offset_host + (uint64_t)N * VH * D,
+                inner_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                alpha, 0, alpha_offset_host + (uint64_t)N * VH,
+                param_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                beta, 0, beta_offset_host + (uint64_t)N * VH,
+                param_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                conv_chunk, 0, conv_frontier, conv_state_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                state_chunk, 0, state_frontier, state_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_qwen35_gdn_chunk_tensor(
+                out_chunk, prepared, g, b, work, chunk_w, chunk_u, chunk_qk,
+                chunk_cumulative_g, conv_chunk, state_chunk,
+                qkv, z, alpha, beta, model_raw, model_bytes,
+                conv_weight_offset, dt_offset, a_offset, norm_offset,
+                N, CHANNELS, QH, VH, D, CONV, 1.0e-6f) != 0);
+            TEST_ASSERT(ds4_gpu_qwen35_gdn_chunk_offset_tensor(
+                out_offset, prepared_offset, g_offset, b_offset, work_offset,
+                w_offset, u_offset, chunk_qk, cumulative_offset,
+                conv_offset, state_offset, qkv_offset, z_offset,
+                alpha_offset, beta_offset, model_raw, model_bytes,
+                conv_weight_offset, dt_offset, a_offset, norm_offset,
+                N, N, CHANNELS, QH, VH, D, CONV, 1.0e-6f) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(
+                out_chunk, 0, out_chunk_host, inner_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(
+                out_offset, (uint64_t)N * VH * D * sizeof(float),
+                out_offset_host + (uint64_t)N * VH * D, inner_bytes) != 0);
+            bool offset_finite = false;
+            const float offset_err = test_qwen_gdn_max_abs_finite(
+                out_chunk_host,
+                out_offset_host + (uint64_t)N * VH * D,
+                (size_t)N * VH * D, &offset_finite);
+            fprintf(stderr,
+                    "ds4-test: Qwen GDN offset binding row=%u out_max_abs=%g\n",
+                    N, offset_err);
+            TEST_ASSERT(offset_finite && offset_err < 2.0e-3f);
+        }
+        ds4_gpu_tensor_free(state_offset);
+        ds4_gpu_tensor_free(conv_offset);
+        ds4_gpu_tensor_free(beta_offset);
+        ds4_gpu_tensor_free(alpha_offset);
+        ds4_gpu_tensor_free(z_offset);
+        ds4_gpu_tensor_free(qkv_offset);
+        ds4_gpu_tensor_free(cumulative_offset);
+        ds4_gpu_tensor_free(u_offset);
+        ds4_gpu_tensor_free(w_offset);
+        ds4_gpu_tensor_free(work_offset);
+        ds4_gpu_tensor_free(b_offset);
+        ds4_gpu_tensor_free(g_offset);
+        ds4_gpu_tensor_free(prepared_offset);
+        ds4_gpu_tensor_free(out_offset);
+        free(out_offset_host);
+        free(state_frontier);
+        free(conv_frontier);
+        free(beta_offset_host);
+        free(alpha_offset_host);
+        free(z_offset_host);
+        free(qkv_offset_host);
+    }
+
+    /* Optional bounded prefill benchmark. Each variant carries state across
+     * enough fixed-size chunks to model a 2048-token prompt. */
+    if (getenv("DS4_TEST_QWEN_GDN_BENCH")) {
+        for (uint32_t variant = 0; variant < 2u; variant++) {
+        double samples[9];
+        for (int sample = -2; sample < 9; sample++) {
+            ds4_gpu_tensor *bench_conv = variant ? conv_chunk : conv_ref;
+            ds4_gpu_tensor *bench_state = variant ? state_chunk : state_ref;
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                bench_conv, 0, conv_host, conv_state_bytes) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_write(
+                bench_state, 0, state_host, state_bytes) != 0);
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            bool bench_ok = ds4_gpu_begin_commands() != 0;
+            for (uint32_t chunk = 0; bench_ok && chunk < 2048u / N; chunk++) {
+                if (variant == 0u) {
+                    bench_ok = ds4_gpu_qwen35_gdn_batch_tensor(
+                        out_ref, prepared, g, b, work, bench_conv, bench_state,
+                        qkv, z, alpha, beta, model_raw, model_bytes,
+                        conv_weight_offset, dt_offset, a_offset, norm_offset,
+                        N, CHANNELS, QH, VH, D, CONV, 1.0e-6f) != 0;
+                } else {
+                    bench_ok = ds4_gpu_qwen35_gdn_chunk_tensor(
+                        out_chunk, prepared, g, b, work, chunk_w, chunk_u,
+                        chunk_qk, chunk_cumulative_g, bench_conv, bench_state,
+                        qkv, z, alpha, beta, model_raw, model_bytes,
+                        conv_weight_offset, dt_offset, a_offset, norm_offset,
+                        N, CHANNELS, QH, VH, D, CONV, 1.0e-6f) != 0;
+                }
+            }
+            bench_ok = ds4_gpu_end_commands() != 0 && bench_ok;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            TEST_ASSERT(bench_ok);
+            if (sample >= 0) {
+                samples[sample] = (double)(t1.tv_sec - t0.tv_sec) * 1.0e3 +
+                    (double)(t1.tv_nsec - t0.tv_nsec) * 1.0e-6;
+            }
+        }
+        for (uint32_t i = 1; i < 9u; i++) {
+            double x = samples[i];
+            uint32_t j = i;
+            while (j > 0u && samples[j - 1u] > x) {
+                samples[j] = samples[j - 1u];
+                j--;
+            }
+            samples[j] = x;
+        }
+        fprintf(stderr,
+                "ds4-test: Qwen GDN 2048-token %s median_ms=%.3f min_ms=%.3f\n",
+                variant ? "blocked-wy" : "recurrent", samples[4], samples[0]);
+        }
+    }
 
 cleanup:
     ds4_gpu_tensor_free(out_ref);

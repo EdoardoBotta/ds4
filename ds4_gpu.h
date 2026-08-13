@@ -2253,6 +2253,24 @@ int ds4_gpu_swiglu_tensor(
         float                   clamp,
         float                   weight);
 
+int ds4_gpu_swiglu_f16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        uint32_t              n,
+        float                 clamp,
+        float                 weight);
+
+int ds4_gpu_matmul_q8_0_f16_rhs_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x_f16,
+        uint64_t              n_tok);
+
 int ds4_gpu_add_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *a,
@@ -2434,10 +2452,43 @@ int ds4_gpu_qwen35_gdn_batch_preserve_first_tensor(
         uint32_t              conv_width,
         float                 eps);
 
-/* Extended-WY chunkwise Gated DeltaNet prefill, specialized for chunks of at
- * most 16 tokens and state_dim=128.  The four chunk_* tensors are reusable
- * scratch; values holds the transformed value rows consumed by the output and
- * final-state kernels. */
+/* Four-row verifier variant. The live state retains row zero and the three
+ * supplied frontiers retain rows one, two, and three respectively. */
+int ds4_gpu_qwen35_gdn_batch_preserve_four_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *prepared,
+        ds4_gpu_tensor       *g,
+        ds4_gpu_tensor       *b,
+        ds4_gpu_tensor       *recurrent_out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *ssm_state,
+        ds4_gpu_tensor       *middle_conv_state,
+        ds4_gpu_tensor       *middle_ssm_state,
+        ds4_gpu_tensor       *penultimate_conv_state,
+        ds4_gpu_tensor       *penultimate_ssm_state,
+        ds4_gpu_tensor       *final_conv_state,
+        ds4_gpu_tensor       *final_ssm_state,
+        const ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *z,
+        const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv_weight_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              a_offset,
+        uint64_t              norm_offset,
+        uint32_t              channels,
+        uint32_t              qk_heads,
+        uint32_t              v_heads,
+        uint32_t              state_dim,
+        uint32_t              conv_width,
+        float                 eps);
+
+/* Blocked extended-WY Gated DeltaNet prefill for chunks up to 64 tokens and
+ * state_dim=128. Expensive products use 8x8 simdgroup matrix operations; the
+ * four chunk_* tensors are reusable bounded storage containing packed F16
+ * intermediates inside their F32-sized allocations. */
 int ds4_gpu_qwen35_gdn_chunk_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *prepared,
@@ -2460,6 +2511,67 @@ int ds4_gpu_qwen35_gdn_chunk_tensor(
         uint64_t              dt_bias_offset,
         uint64_t              a_offset,
         uint64_t              norm_offset,
+        uint32_t              n_tokens,
+        uint32_t              channels,
+        uint32_t              qk_heads,
+        uint32_t              v_heads,
+        uint32_t              state_dim,
+        uint32_t              conv_width,
+        float                 eps);
+
+/* Same blocked-WY operation, reading and writing a contiguous row slice of
+ * the batch tensors without allocating temporary tensor views. Scratch and
+ * persistent recurrent-state tensors remain based at row zero. */
+int ds4_gpu_qwen35_gdn_chunk_offset_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *prepared,
+        ds4_gpu_tensor       *g,
+        ds4_gpu_tensor       *b,
+        ds4_gpu_tensor       *values,
+        ds4_gpu_tensor       *chunk_w,
+        ds4_gpu_tensor       *chunk_u,
+        ds4_gpu_tensor       *chunk_qk,
+        ds4_gpu_tensor       *chunk_cumulative_g,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *ssm_state,
+        const ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *z,
+        const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv_weight_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              a_offset,
+        uint64_t              norm_offset,
+        uint32_t              row_offset,
+        uint32_t              n_tokens,
+        uint32_t              channels,
+        uint32_t              qk_heads,
+        uint32_t              v_heads,
+        uint32_t              state_dim,
+        uint32_t              conv_width,
+        float                 eps);
+
+int ds4_gpu_qwen35_gdn_batch_offset_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *prepared,
+        ds4_gpu_tensor       *g,
+        ds4_gpu_tensor       *b,
+        ds4_gpu_tensor       *values,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *ssm_state,
+        const ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *z,
+        const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv_weight_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              a_offset,
+        uint64_t              norm_offset,
+        uint32_t              row_offset,
         uint32_t              n_tokens,
         uint32_t              channels,
         uint32_t              qk_heads,
