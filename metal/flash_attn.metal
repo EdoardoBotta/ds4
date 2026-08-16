@@ -35,9 +35,11 @@ struct ds4_metal_args_flash_attn_ext_pad {
     uint64_t nb11;
     uint64_t nb12;
     uint64_t nb13;
+    uint64_t row11;
     uint64_t nb21;
     uint64_t nb22;
     uint64_t nb23;
+    uint64_t row21;
     int32_t  ne31;
     int32_t  ne32;
     int32_t  ne33;
@@ -166,17 +168,17 @@ kernel void kernel_flash_attn_ext_pad(
         device char * v_dst = v_pad + args.nb21*i1 + args.nb21*C*i2 + args.nb21*C*args.ne_12_2*i3;
 
         if (i1 >= icp) {
-            for (uint64_t i = tiitg; i < args.nb11; i += ntg.x) {
+            for (uint64_t i = tiitg; i < args.row11; i += ntg.x) {
                 k_dst[i] = 0;
             }
-            for (uint64_t i = tiitg; i < args.nb21; i += ntg.x) {
+            for (uint64_t i = tiitg; i < args.row21; i += ntg.x) {
                 v_dst[i] = 0;
             }
         } else {
-            for (uint64_t i = tiitg; i < args.nb11; i += ntg.x) {
+            for (uint64_t i = tiitg; i < args.row11; i += ntg.x) {
                 k_dst[i] = k_src[i];
             }
-            for (uint64_t i = tiitg; i < args.nb21; i += ntg.x) {
+            for (uint64_t i = tiitg; i < args.row21; i += ntg.x) {
                 v_dst[i] = v_src[i];
             }
         }
@@ -203,8 +205,6 @@ kernel void kernel_flash_attn_ext_pad(
 constant int32_t FC_flash_attn_ext_blk_nqptg [[function_constant(FC_FLASH_ATTN_EXT_BLK + 24)]];
 constant int32_t FC_flash_attn_ext_blk_ncpsg [[function_constant(FC_FLASH_ATTN_EXT_BLK + 25)]];
 
-// DS4 FlashAttention mask scan: marks blocks so the non-vector kernel can skip
-// blocks that are entirely masked or entirely zero.
 kernel void kernel_flash_attn_ext_blk(
         constant ds4_metal_args_flash_attn_ext_blk & args,
         device const char * mask,
@@ -213,49 +213,36 @@ kernel void kernel_flash_attn_ext_blk(
         ushort tiisg[[thread_index_in_simdgroup]]) {
     const int32_t Q = FC_flash_attn_ext_blk_nqptg;
     const int32_t C = FC_flash_attn_ext_blk_ncpsg;
-
-    constexpr short NW  = N_SIMDWIDTH;
-
     const int32_t i3 = tgpig[2]/args.ne32;
     const int32_t i2 = tgpig[2]%args.ne32;
     const int32_t i1 = tgpig[1];
     const int32_t i0 = tgpig[0];
-
     char res = i0*C + C > args.ne30 ? 1 : 0;
 
-    if ((C > NW || Q > 1) && res == 0) {
+    if ((C > N_SIMDWIDTH || Q > 1) && res == 0) {
         half mmin =  MAXHALF;
         half mmax = -MAXHALF;
         const int32_t q0 = i1*Q;
-
         FOR_UNROLL (short j = 0; j < Q; ++j) {
             if (q0 + j < args.ne31) {
-                device const half * mask_src =
-                    (device const half *) (mask + (q0 + j)*args.nb31 + i2*args.nb32 + i3*args.nb33) +
-                    i0*C + tiisg;
-
-                FOR_UNROLL (short ii = 0; ii < C/NW; ++ii) {
-                    mmin = min(mmin, mask_src[ii*NW]);
-                    mmax = max(mmax, mask_src[ii*NW]);
+                device const half * src =
+                    (device const half *)(mask + (q0 + j)*args.nb31 +
+                    i2*args.nb32 + i3*args.nb33) + i0*C + tiisg;
+                FOR_UNROLL (short ii = 0; ii < C/N_SIMDWIDTH; ++ii) {
+                    mmin = min(mmin, src[ii*N_SIMDWIDTH]);
+                    mmax = max(mmax, src[ii*N_SIMDWIDTH]);
                 }
             }
         }
-
         mmin = simd_min(mmin);
         mmax = simd_max(mmax);
-
         if (mmax > -MAXHALF) {
-            if (mmin == 0.0 && mmax == 0.0) {
-                res = 2;
-            } else {
-                res = 1;
-            }
+            res = mmin == 0.0 && mmax == 0.0 ? 2 : 1;
         }
     }
 
-    const int32_t nblk1 = ((args.ne01 + Q - 1)/Q);
-    const int32_t nblk0 = ((args.ne30 + C - 1)/C);
-
+    const int32_t nblk1 = (args.ne01 + Q - 1)/Q;
+    const int32_t nblk0 = (args.ne30 + C - 1)/C;
     if (tiisg == 0) {
         dst[((i3*args.ne32 + i2)*nblk1 + i1)*nblk0 + i0] = res;
     }
@@ -304,6 +291,7 @@ template<
     short DV,
     short Q,
     short C,
+    bool APPLY_GATE,
     short NSG>
 void kernel_flash_attn_ext_impl(
         constant ds4_metal_args_flash_attn_ext & args,
@@ -837,7 +825,11 @@ void kernel_flash_attn_ext_impl(
             break;
         }
 
-        device float4 * dst4 = (device float4 *) dst + ((uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)(iq1 + j)*args.ne1)*DV4;
+        const uint64_t row =
+            (uint64_t)iq3*args.ne2*args.ne1 + iq2 +
+            (uint64_t)(iq1 + j)*args.ne1;
+        device float4 * dst4 = (device float4 *) dst + row*DV4;
+        device const float4 * gate4 = (device const float4 *) sinks + row*DV4;
 
         const float scale = S[jj] == 0.0 ? 0.0f : 1.0f/S[jj];
 
@@ -845,11 +837,19 @@ void kernel_flash_attn_ext_impl(
             FOR_UNROLL (short ii = 0; ii < DV4/NW; ++ii) {
                 const short i = ii*NW + tiisg;
 
-                dst4[i] = (float4) so4[j*PV4 + i]*scale;
+                float4 result = (float4) so4[j*PV4 + i]*scale;
+                if (APPLY_GATE) {
+                    result *= 1.0f/(1.0f + exp(-gate4[i]));
+                }
+                dst4[i] = result;
             }
         } else {
             for (short i = tiisg; i < DV4; i += NW) {
-                dst4[i] = (float4) so4[j*PV4 + i]*scale;
+                float4 result = (float4) so4[j*PV4 + i]*scale;
+                if (APPLY_GATE) {
+                    result *= 1.0f/(1.0f + exp(-gate4[i]));
+                }
+                dst4[i] = result;
             }
         }
     }
@@ -888,7 +888,8 @@ template<
     short DK,
     short DV,
     short Q  = OP_FLASH_ATTN_EXT_NQPSG,
-    short C  = OP_FLASH_ATTN_EXT_NCPSG>
+    short C  = OP_FLASH_ATTN_EXT_NCPSG,
+    bool APPLY_GATE = false>
 kernel void kernel_flash_attn_ext(
         constant ds4_metal_args_flash_attn_ext & args,
         device const char * q,
@@ -903,7 +904,7 @@ kernel void kernel_flash_attn_ext(
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
-#define FWD_TMPL q_t, q4_t, q8x8_t, k_t, k4x4_t, k8x8_t, v_t, v4x4_t, v8x8_t, qk_t, qk8x8_t, s_t, s2_t, s8x8_t, o_t, o4_t, o8x8_t, kd4x4_t, nl_k, deq_k, vd4x4_t, nl_v, deq_v, DK, DV, Q, C
+#define FWD_TMPL q_t, q4_t, q8x8_t, k_t, k4x4_t, k8x8_t, v_t, v4x4_t, v8x8_t, qk_t, qk8x8_t, s_t, s2_t, s8x8_t, o_t, o4_t, o8x8_t, kd4x4_t, nl_k, deq_k, vd4x4_t, nl_v, deq_v, DK, DV, Q, C, APPLY_GATE
 #define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, dst, shmem_f16, tgpig, tiisg, sgitg
     switch (FC_flash_attn_ext_nsg) {
         case 4: kernel_flash_attn_ext_impl<FWD_TMPL, 4>(FWD_ARGS); break;
@@ -921,16 +922,15 @@ kernel void kernel_flash_attn_ext(
     float,  float2,    simdgroup_float8x8, \
     float,  float4,    simdgroup_float8x8
 
-typedef decltype(kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 512, 512>) flash_attn_ext_dk512_t;
-typedef decltype(kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 256, 256>) flash_attn_ext_dk256_t;
+typedef decltype(kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 256, 256, OP_FLASH_ATTN_EXT_NQPSG, OP_FLASH_ATTN_EXT_NCPSG, true>) flash_attn_ext_dk256_t;
+typedef decltype(kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 256, 256>) flash_attn_ext_dk256_nogate_t;
 
-// Host-visible prefill FlashAttention variant for DS4's 512-wide F16 K/V rows.
-template [[host_name("kernel_flash_attn_ext_f16_dk512_dv512")]]
-kernel flash_attn_ext_dk512_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 512, 512>;
-
-// Host-visible prefill FlashAttention variant for GLM's 256-wide F16 K/V rows.
+// Host-visible prefill FlashAttention variants for Qwen's 256-wide F16 K/V rows.
 template [[host_name("kernel_flash_attn_ext_f16_dk256_dv256")]]
-kernel flash_attn_ext_dk256_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 256, 256>;
+kernel flash_attn_ext_dk256_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 256, 256, OP_FLASH_ATTN_EXT_NQPSG, OP_FLASH_ATTN_EXT_NCPSG, true>;
+
+template [[host_name("kernel_flash_attn_ext_f16_dk256_dv256_nogate")]]
+kernel flash_attn_ext_dk256_nogate_t kernel_flash_attn_ext<FA_NONVEC_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 256, 256>;
 
 #undef FA_NONVEC_TYPES
 
@@ -1395,24 +1395,6 @@ kernel void kernel_flash_attn_ext_vec(
 #undef NS20
 }
 
-#define FA_TYPES \
-           half4,  \
-           half4,  \
-           half4,  \
-    float,         \
-    float, float4, \
-           float4
-
-#define FA_TYPES_F32 \
-           half4,  \
-           float4, \
-           float4, \
-    float,         \
-    float, float4, \
-           float4
-
-typedef decltype(kernel_flash_attn_ext_vec<FA_TYPES, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 128, 128, 4>) flash_attn_ext_vec_t;
-
 #define QWEN35_FA_TYPES \
     float4,        \
     half4,         \
@@ -1423,17 +1405,11 @@ typedef decltype(kernel_flash_attn_ext_vec<FA_TYPES, half4, 1, dequantize_f16_t4
 
 typedef decltype(kernel_flash_attn_ext_vec<QWEN35_FA_TYPES, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 256, 256, 4>) qwen35_flash_attn_ext_vec_t;
 
-// Host-visible decode FlashAttention variant for DS4's 512-wide F16 K/V rows.
-template [[host_name("kernel_flash_attn_ext_vec_f16_dk512_dv512")]]  kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES,     half4,  1, dequantize_f16_t4, half4,  1, dequantize_f16_t4, 512, 512, 1>;
-
 // Qwen3.6 native-cache decode specialization. Keep Q in F32 to minimize the
 // numerical difference from the legacy two-pass attention implementation.
 template [[host_name("kernel_qwen35_flash_attn_ext_vec_f16_dk256_dv256")]] kernel qwen35_flash_attn_ext_vec_t kernel_flash_attn_ext_vec<QWEN35_FA_TYPES, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 256, 256, 4>;
 
 #undef QWEN35_FA_TYPES
-
-#undef FA_TYPES
-#undef FA_TYPES_F32
 
 constant int32_t FC_flash_attn_ext_vec_reduce_DV  [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 0)]];
 constant int32_t FC_flash_attn_ext_vec_reduce_NWG [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 1)]];

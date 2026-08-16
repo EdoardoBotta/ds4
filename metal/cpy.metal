@@ -50,6 +50,5 @@ kernel void kernel_cpy_t_t(
     }
 }
 
-typedef decltype(kernel_cpy_t_t<float, float>) kernel_cpy_t;
-template [[host_name("kernel_cpy_f32_f16")]] kernel kernel_cpy_t kernel_cpy_t_t<float, half>;
+typedef decltype(kernel_cpy_t_t<half, half>) kernel_cpy_t;
 template [[host_name("kernel_cpy_f16_f16")]] kernel kernel_cpy_t kernel_cpy_t_t<half, half>;
