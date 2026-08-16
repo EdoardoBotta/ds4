@@ -29,7 +29,7 @@ Q8_0 GGUF
   -> 64 transformer blocks
        [Gated DeltaNet, Gated DeltaNet, Gated DeltaNet, full attention] x 16
   -> RMSNorm + Q8_0 output projection
-  -> greedy token ────────────────┐
+  -> sampled token ───────────────┐
                                   v
        NextN block -> draft suffix -> batched target verification
                                   -> accepted tokens
@@ -54,6 +54,9 @@ Unexpected GGUF metadata or tensor layouts fail early.
   the HTTP server reuses the same allocated graph between serial requests.
 - The optional Qwen3.6 NextN model drafts one token ahead; the target verifies
   a short suffix in one multi-row graph dispatch.
+- Temperature zero retains GPU top-k equality verification. Positive
+  temperatures use exact speculative acceptance/rejection, including sampling
+  rejected proposals from the `(target - draft)+` residual distribution.
 - Speculative verification can perform top-k on GPU, elide the recurrent-state
   snapshot, fuse draft-cache catch-up, and retain accepted Gated DeltaNet
   frontiers without replaying target layers.
@@ -80,24 +83,30 @@ DS4_LOG=timing ./ds4 \
   -n 8 -c 64 --temp 0 --nothink
 ```
 
-Enable greedy speculative decoding with the matching NextN GGUF. As in the
-larger CLI, `--mtp-draft 1` means ordinary decoding and values 2 through 16
-select the maximum verifier width.
+Enable greedy speculative decoding with the matching NextN GGUF. Supplying
+`--mtp` selects the measured three-row verifier and margin 3 by default.
+`--mtp-draft 1` means ordinary decoding, while values 2 through 16 override
+the maximum verifier width.
 
 ```sh
-DS4_QWEN_MTP_GPU_TOPK=1 \
-DS4_QWEN_MTP_NO_SNAPSHOT=1 \
-DS4_QWEN_MTP_FUSED_CATCHUP=1 \
 ./ds4 \
   -m gguf/Qwen3.6-27B-Q8_0.gguf \
   --mtp gguf/mtp-Qwen3.6-27B-Q8_0.gguf \
-  --mtp-draft 3 --mtp-margin 3 \
   -p 'Reply with exactly: hello' \
   -n 32 -c 512 --temp 0 --nothink
 ```
 
-Metal and greedy decoding are the only backend and sampler. `--metal` and
-`--temp 0` remain accepted so existing baseline commands still work.
+Metal is the only backend. `--temp 0` selects the unchanged greedy fast path;
+positive values enable temperature sampling, and `--seed` makes a run
+reproducible. The same sampler works with or without `--mtp`.
+
+```sh
+./ds4 \
+  -m gguf/Qwen3.6-27B-Q8_0.gguf \
+  --mtp gguf/mtp-Qwen3.6-27B-Q8_0.gguf \
+  -p 'Write one sentence about the moon' \
+  -n 32 -c 512 --temp 0.8 --seed 123 --nothink
+```
 
 ### Interactive session
 
@@ -108,7 +117,7 @@ and `/quit` exits. Speculative decoding uses the same options as one-shot mode.
 ```sh
 ./ds4 \
   -m gguf/Qwen3.6-27B-Q8_0.gguf \
-  --mtp gguf/mtp-Qwen3.6-27B-Q8_0.gguf --mtp-draft 3 \
+  --mtp gguf/mtp-Qwen3.6-27B-Q8_0.gguf \
   -n 256 -c 32768 --nothink
 ```
 
@@ -123,12 +132,12 @@ It implements health/model discovery plus OpenAI non-streaming and SSE APIs at
 ```sh
 ./ds4-server \
   -m gguf/Qwen3.6-27B-Q8_0.gguf \
-  --mtp gguf/mtp-Qwen3.6-27B-Q8_0.gguf --mtp-draft 3 \
+  --mtp gguf/mtp-Qwen3.6-27B-Q8_0.gguf \
   -n 256 -c 32768 --host 127.0.0.1 --port 8000
 
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Hello"}],"stream":true}'
+  -d '{"messages":[{"role":"user","content":"Hello"}],"temperature":0.8,"seed":123,"stream":true}'
 ```
 
 Useful diagnostic/ablation variables are:
@@ -141,16 +150,17 @@ Useful diagnostic/ablation variables are:
 - `DS4_QWEN_FLASH_ATTN=0`: disable FlashAttention.
 - `DS4_QWEN_PREFILL_FUSED_RESIDUAL_NORM=0`: disable the prefill fusion.
 - `DS4_QWEN_DISABLE_FFN_MID_F16=1`: force the F32 FFN intermediate.
-- `DS4_QWEN_MTP_GPU_TOPK=1`: keep draft/verification argmax selection on GPU.
-- `DS4_QWEN_MTP_NO_SNAPSHOT=1`: commit retained recurrent frontiers directly.
-- `DS4_QWEN_MTP_FUSED_CATCHUP=1`: encode MTP KV catch-up in one command buffer.
+- `DS4_QWEN_MTP_GPU_TOPK=0`: move draft/verification argmax selection to CPU.
+- `DS4_QWEN_MTP_NO_SNAPSHOT=0`: restore recurrent-state snapshot copies.
+- `DS4_QWEN_MTP_FUSED_CATCHUP=0`: split MTP KV catch-up across command buffers.
 - `DS4_QWEN_MTP_WIDE_FRONTIERS=1`: retain the extra frontier needed by a
   four-row verifier.
 - `DS4_QWEN_MTP_STATS=1`: print proposal and acceptance counters.
 
-The prefill switches are ablations whose fast settings are the defaults. The
-MTP acceleration switches are explicit experiments in the larger runtime and
-remain opt-in here so both binaries expose the same peak configuration.
+The prefill switches use their fast settings by default. GPU top-k, recurrent
+snapshot elision, and fused KV catch-up are also enabled by default for MTP;
+set their variables to `0` for baseline ablations. Wide frontiers remain
+opt-in because the default three-row verifier does not need them.
 
 ## Tests
 
@@ -161,23 +171,24 @@ DS4_TEST_MODEL=gguf/Qwen3.6-27B-Q8_0.gguf \
 DS4_TEST_MTP=gguf/mtp-Qwen3.6-27B-Q8_0.gguf make test
 ```
 
-The first command checks the CLI without loading a model. The second also runs
-a deterministic live-model smoke test.
+The first command checks the CLI without loading a model. The live-model test
+checks greedy output and fixed-seed temperature sampling; setting
+`DS4_TEST_MTP` exercises the exact speculative sampler too.
 
 ## What was cut
 
 The original default macOS CLI compiled 159023 implementation lines: 132228
 lines of C/Objective-C plus 26795 lines of runtime-compiled Metal. This branch
-compiles 16796: 4383 in the Qwen host and frontends, 6094 in the Qwen-only Metal
-backend, and 6319 in its nine runtime-compiled shader files. The public GPU
+compiles 16549: 4628 in the Qwen host and frontends, 5808 in the Qwen-only Metal
+backend, and 6113 in its nine runtime-compiled shader files. The public GPU
 header is another 442 lines, down from 3196.
 
 | Surface | Before | After | Removed |
 |---|---:|---:|---:|
-| Main host engine + frontends | 70897 | 4383 | 66514 (93.8%) |
-| Metal host backend | 44603 | 6094 | 38509 (86.3%) |
-| Runtime Metal shaders | 26795 | 6319 | 20476 (76.4%) |
-| Compiled implementation | 159023 | 16796 | 142227 (89.4%) |
+| Main host engine + frontends | 70897 | 4628 | 66269 (93.5%) |
+| Metal host backend | 44603 | 5808 | 38795 (87.0%) |
+| Runtime Metal shaders | 26795 | 6113 | 20682 (77.2%) |
+| Compiled implementation | 159023 | 16549 | 142474 (89.6%) |
 
 The repository also loses millions of lines of generated experiment fixtures,
 but those are not counted as inference-engine simplification.
@@ -210,7 +221,8 @@ runtime did not lose peak prefill, ordinary decode, or speculative performance.
 
 This is a focused inference example, not a drop-in replacement for the full
 product. It supports one-shot and persistent chat, a serial OpenAI-compatible
-HTTP boundary, Qwen's think/no-think prefix, greedy streaming output, one
-resident Metal target, and an optional matching NextN support model. That
+HTTP boundary, Qwen's think/no-think prefix, greedy or temperature-sampled
+streaming output, one resident Metal target, and an optional matching NextN
+support model. That
 narrow contract keeps the control flow readable without replacing optimized
 kernels with toy implementations.

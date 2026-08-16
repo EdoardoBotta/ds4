@@ -3586,9 +3586,14 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
          */
         const bool split_nax_prefix =
             !g_quality_mode && n_tok >= 192u && (n_tok % 32u) != 0u;
-        const uint64_t nax_rows =
+        uint64_t nax_rows =
             (n_tok % 32u) == 0u ? n_tok :
             (split_nax_prefix ? n_tok - (n_tok % 32u) : 0u);
+        /* Large unaligned batches are faster with a wide N=128 prefix even
+         * when that leaves up to 127 rows for the boundary-safe tail. */
+        if (split_nax_prefix && n_tok >= 384u) {
+            nax_rows = n_tok - (n_tok % 128u);
+        }
         uint64_t generic_row0 = 0u;
         uint64_t generic_rows = n_tok;
         if (ds4_gpu_mpp_available() &&
@@ -3784,7 +3789,7 @@ int ds4_gpu_matmul_q8_0_f16_rhs_tensor(
         uint64_t              n_tok) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !model_map || !x_f16 || n_tok == 0u ||
-        (n_tok % 32u) != 0u || (in_dim % 32u) != 0u ||
+        (in_dim % 32u) != 0u ||
         (out_dim % 64u) != 0u || in_dim > UINT32_MAX ||
         out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
         return 0;
@@ -3804,8 +3809,9 @@ int ds4_gpu_matmul_q8_0_f16_rhs_tensor(
         uint64_t inner_offset = 0u;
         id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(
             model_map, model_size, weight_offset, weight_bytes, &inner_offset);
+        const bool bc_out = (n_tok % 32u) != 0u;
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mm_pipeline(
-            "kernel_mul_mm_q8_0_f16_pairs", false, false);
+            "kernel_mul_mm_q8_0_f16_pairs", false, bc_out);
         if (!wbuf || !pipeline) return 0;
 
         int owned = 0;
@@ -3823,9 +3829,12 @@ int ds4_gpu_matmul_q8_0_f16_rhs_tensor(
         [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x_f16) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-        [enc setThreadgroupMemoryLength:4096u + 32u*32u*sizeof(uint16_t)
+        const NSUInteger stage_bytes =
+            4096u + 32u*32u*sizeof(uint16_t);
+        const NSUInteger boundary_bytes = 32u*64u*sizeof(float);
+        [enc setThreadgroupMemoryLength:bc_out ? boundary_bytes : stage_bytes
                                 atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_tok/32u),
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((n_tok + 31u)/32u),
                                               (NSUInteger)(out_dim/64u), 1u)
              threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
         ds4_gpu_end_compute_encoder(cb, enc);

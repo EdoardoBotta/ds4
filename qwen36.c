@@ -2,7 +2,7 @@
  *
  * This is a deliberately narrow, vertical runtime: mmap a Q8_0 GGUF, parse
  * its tokenizer and weights, construct the persistent Qwen graph, prefill in
- * chunks, and decode greedily. The optimized Metal backend is kept intact;
+ * chunks, and decode. The optimized Metal backend is kept intact;
  * only unrelated model families, general frontends, and host execution paths
  * were removed.
  */
@@ -960,27 +960,28 @@ static bool qwen_prefill_ffn_mid_f16_enabled(void) {
            getenv("DS4_QWEN_DISABLE_FFN_MID_F16") == NULL;
 }
 
-static bool qwen_mtp_experiment_enabled(const char *name) {
+static bool qwen_mtp_option_enabled(const char *name, bool default_enabled) {
     const char *env = getenv(name);
-    return env && env[0] != '\0' && strcmp(env, "0") != 0 &&
+    if (!env) return default_enabled;
+    return env[0] != '\0' && strcmp(env, "0") != 0 &&
            strcasecmp(env, "false") != 0 &&
            strcasecmp(env, "off") != 0;
 }
 
 static bool qwen_mtp_gpu_topk_enabled(void) {
-    return qwen_mtp_experiment_enabled("DS4_QWEN_MTP_GPU_TOPK");
+    return qwen_mtp_option_enabled("DS4_QWEN_MTP_GPU_TOPK", true);
 }
 
 static bool qwen_mtp_no_snapshot_enabled(void) {
-    return qwen_mtp_experiment_enabled("DS4_QWEN_MTP_NO_SNAPSHOT");
+    return qwen_mtp_option_enabled("DS4_QWEN_MTP_NO_SNAPSHOT", true);
 }
 
 static bool qwen_mtp_fused_catchup_enabled(void) {
-    return qwen_mtp_experiment_enabled("DS4_QWEN_MTP_FUSED_CATCHUP");
+    return qwen_mtp_option_enabled("DS4_QWEN_MTP_FUSED_CATCHUP", true);
 }
 
 static bool qwen_mtp_wide_frontiers_enabled(void) {
-    return qwen_mtp_experiment_enabled("DS4_QWEN_MTP_WIDE_FRONTIERS");
+    return qwen_mtp_option_enabled("DS4_QWEN_MTP_WIDE_FRONTIERS", false);
 }
 
 static bool qwen_decode_experiment_enabled(const char *name) {
@@ -1683,6 +1684,102 @@ static int sample_argmax(const float *logits, uint32_t n_vocab) {
     return best;
 }
 
+typedef struct {
+    float max;
+    double sum;
+} qwen_softmax_norm;
+
+static uint64_t qwen_rng_next(uint64_t *state) {
+    uint64_t z = (*state += UINT64_C(0x9e3779b97f4a7c15));
+    z = (z ^ (z >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)) * UINT64_C(0x94d049bb133111eb);
+    return z ^ (z >> 31);
+}
+
+static double qwen_rng_uniform(uint64_t *state) {
+    return (double)(qwen_rng_next(state) >> 11) * 0x1.0p-53;
+}
+
+static uint64_t qwen_default_seed(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return ((uint64_t)ts.tv_sec << 32) ^ (uint64_t)ts.tv_nsec ^
+        (uint64_t)getpid();
+}
+
+static qwen_softmax_norm qwen_softmax_stats(
+        const float *logits, float temperature) {
+    qwen_softmax_norm norm = {.max = -FLT_MAX, .sum = 0.0};
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        if (logits[i] > norm.max) norm.max = logits[i];
+    }
+    const double inv_t = 1.0 / (double)temperature;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        norm.sum += exp(((double)logits[i] - norm.max) * inv_t);
+    }
+    return norm;
+}
+
+static int sample_temperature(
+        const float *logits, float temperature, uint64_t *rng,
+        qwen_softmax_norm *norm_out) {
+    qwen_softmax_norm norm = qwen_softmax_stats(logits, temperature);
+    double sample = qwen_rng_uniform(rng) * norm.sum;
+    const double inv_t = 1.0 / (double)temperature;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        sample -= exp(((double)logits[i] - norm.max) * inv_t);
+        if (sample <= 0.0) {
+            if (norm_out) *norm_out = norm;
+            return (int)i;
+        }
+    }
+    if (norm_out) *norm_out = norm;
+    return (int)DS4_N_VOCAB - 1;
+}
+
+/* Exact speculative correction: accept a draft sample with min(1, p/q),
+ * otherwise draw from the normalized positive residual (p - q)+. */
+static int qwen_spec_sample(
+        const float *target, const float *draft, int proposal,
+        qwen_softmax_norm draft_norm, float temperature, uint64_t *rng,
+        bool *accepted) {
+    const qwen_softmax_norm target_norm =
+        qwen_softmax_stats(target, temperature);
+    const double inv_t = 1.0 / (double)temperature;
+    const double p_scale = 1.0 / target_norm.sum;
+    const double q_scale = 1.0 / draft_norm.sum;
+    const double p =
+        exp(((double)target[proposal] - target_norm.max) * inv_t) * p_scale;
+    const double q =
+        exp(((double)draft[proposal] - draft_norm.max) * inv_t) * q_scale;
+    if (qwen_rng_uniform(rng) * q <= p) {
+        *accepted = true;
+        return proposal;
+    }
+
+    *accepted = false;
+    double residual_sum = 0.0;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        const double pi =
+            exp(((double)target[i] - target_norm.max) * inv_t) * p_scale;
+        const double qi =
+            exp(((double)draft[i] - draft_norm.max) * inv_t) * q_scale;
+        if (pi > qi) residual_sum += pi - qi;
+    }
+    double sample = qwen_rng_uniform(rng) * residual_sum;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        const double pi =
+            exp(((double)target[i] - target_norm.max) * inv_t) * p_scale;
+        const double qi =
+            exp(((double)draft[i] - draft_norm.max) * inv_t) * q_scale;
+        if (pi > qi) {
+            sample -= pi - qi;
+            if (sample <= 0.0) return (int)i;
+        }
+    }
+    return sample_temperature(target, temperature, rng, NULL);
+}
+
 static void print_top_logits(
         FILE          * fp,
         const char    * label,
@@ -1816,6 +1913,8 @@ typedef struct {
     float *logits;
     float *draft_logits;
     float *spec_logits;
+    float *draft_spec_logits;
+    uint64_t rng_state;
     uint32_t pos;
     int mtp_draft_tokens;
     float mtp_margin;
@@ -2229,9 +2328,10 @@ static bool qwen_mtp_graph_read_draft(
         ds4_qwen_mtp_graph *g,
         float *logits_host,
         int *draft_out,
-        float *margin_out) {
+        float *margin_out,
+        bool full_logits) {
     if (!g || !logits_host || !draft_out) return false;
-    if (qwen_mtp_gpu_topk_enabled()) {
+    if (!full_logits && qwen_mtp_gpu_topk_enabled()) {
         uint32_t top_ids[2] = {0u, 0u};
         float top_values[2] = {0.0f, 0.0f};
         bool ok = ds4_gpu_tensor_read(g->top_ids, 0, top_ids,
@@ -2270,7 +2370,8 @@ static bool qwen_mtp_graph_step(
         uint32_t min_pos,
         float *logits_host,
         int *draft_out,
-        float *margin_out) {
+        float *margin_out,
+        bool full_logits) {
     const bool produce_draft = logits_host != NULL && draft_out != NULL;
     if (!g || !model || !weights || !target_hidden ||
         ((logits_host == NULL) != (draft_out == NULL)) ||
@@ -2370,7 +2471,8 @@ static bool qwen_mtp_graph_step(
     if (ok && produce_draft) ok = ds4_gpu_matmul_q8_0_tensor(
         g->logits, model->map, model->size, weights->output->abs_offset,
         DS4_N_EMBD, DS4_N_VOCAB, g->head_norm, 1) != 0;
-    const bool gpu_topk = produce_draft && qwen_mtp_gpu_topk_enabled();
+    const bool gpu_topk = produce_draft && !full_logits &&
+        qwen_mtp_gpu_topk_enabled();
     if (ok && gpu_topk) ok = ds4_gpu_indexer_topk_tensor(
         g->top_ids, g->logits, DS4_N_VOCAB, 1u, 2u) != 0;
     if (ok && own_commands) ok = ds4_gpu_end_commands() != 0;
@@ -2381,7 +2483,7 @@ static bool qwen_mtp_graph_step(
     ds4_gpu_tensor_free(value_view);
     if (!ok || !produce_draft || !own_commands) return ok;
     return qwen_mtp_graph_read_draft(
-        g, logits_host, draft_out, margin_out);
+        g, logits_host, draft_out, margin_out, full_logits);
 }
 
 /* Decode one token through three GDN layers followed by each fourth full-
@@ -2771,7 +2873,8 @@ static bool qwen_graph_forward_chunk(
         }
         const bool ffn_mid_f16 =
             qwen_prefill_ffn_mid_f16_enabled() &&
-            n_tokens >= 32u && (n_tokens % 32u) == 0u;
+            (n_tokens >= 128u ||
+             (n_tokens >= 32u && (n_tokens % 32u) == 0u));
         ds4_gpu_tensor *ffn_mid = ffn_mid_f16 ? g->ffn_mid : g->ffn_gate;
         if (ok) {
             ok = ds4_gpu_matmul_q8_0_tensor(
@@ -2875,8 +2978,14 @@ typedef struct {
     float *logits;
     float *draft_logits;
     float *spec_logits;
+    float *draft_spec_logits;
+    qwen_softmax_norm draft_norm[DS4_QWEN_SPEC_ROWS_MAX - 1u];
+    float temperature;
+    uint64_t *rng;
     int draft_token;
     int have_draft;
+    int pending_token;
+    bool have_pending_token;
     float draft_margin;
     uint32_t draft_min_pos;
     uint32_t first_attempts;
@@ -2891,8 +3000,8 @@ typedef struct {
 } qwen_mtp_state;
 
 /* Commit one target token and, once seeded, verify a short NextN suffix in a
- * single target batch. This is the production greedy speculative algorithm
- * with the general engine/session scaffolding removed. */
+ * single target batch. Temperature zero keeps the equality verifier; positive
+ * temperature uses exact acceptance/rejection sampling. */
 static int qwen_mtp_spec_cycle(
         qwen_mtp_state *s,
         uint32_t pos,
@@ -2911,6 +3020,7 @@ static int qwen_mtp_spec_cycle(
         pos >= target->ctx_cap) {
         return -1;
     }
+    const bool stochastic = s->temperature > 0.0f;
 
     if (!s->have_draft || accepted_cap < 2 ||
         pos + 2u > target->ctx_cap || first_token == eos_token) {
@@ -2923,14 +3033,29 @@ static int qwen_mtp_spec_cycle(
         s->have_draft = 0;
         if (accepted_cap >= 2 && first_token != eos_token &&
             pos + 1u < target->ctx_cap) {
-            const int next = sample_argmax(s->logits, DS4_N_VOCAB);
+            const int next = stochastic ?
+                sample_temperature(
+                    s->logits, s->temperature, s->rng, NULL) :
+                sample_argmax(s->logits, DS4_N_VOCAB);
+            if (stochastic) {
+                s->pending_token = next;
+                s->have_pending_token = true;
+            }
             const uint32_t draft_pos = pos + 1u;
             int proposed = -1;
             float proposed_margin = 0.0f;
             if (next != eos_token && qwen_mtp_graph_step(
                     draft, s->draft_model, s->draft_weights,
                     target->attn_norm, next, draft_pos, draft_pos,
-                    s->draft_logits, &proposed, &proposed_margin)) {
+                    s->draft_logits, &proposed, &proposed_margin,
+                    stochastic)) {
+                if (stochastic) {
+                    memcpy(s->draft_spec_logits, s->draft_logits,
+                           (size_t)DS4_N_VOCAB * sizeof(float));
+                    proposed = sample_temperature(
+                        s->draft_logits, s->temperature, s->rng,
+                        &s->draft_norm[0]);
+                }
                 s->draft_min_pos = draft_pos;
                 s->draft_token = proposed;
                 s->draft_margin = proposed_margin;
@@ -2971,7 +3096,7 @@ static int qwen_mtp_spec_cycle(
             (uint64_t)s->first_accepted * 20u >=
                 (uint64_t)s->first_attempts * 17u;
         draft_margin = recent_allows_deeper && lifetime_allows_deeper ?
-            (qwen_mtp_gpu_topk_enabled() ? s->draft_margin :
+            (!stochastic && qwen_mtp_gpu_topk_enabled() ? s->draft_margin :
              qwen_logits_top_margin(s->draft_logits)) : -FLT_MAX;
     }
 
@@ -2984,12 +3109,22 @@ static int qwen_mtp_spec_cycle(
                 draft, s->draft_model, s->draft_weights,
                 draft->head_norm, proposals[draft_n - 1u],
                 pos + draft_n, s->draft_min_pos,
-                s->draft_logits, &next, &next_margin)) {
+                s->draft_logits, &next, &next_margin, stochastic)) {
             break;
+        }
+        if (stochastic) {
+            float *draft_row = s->draft_spec_logits +
+                (uint64_t)draft_n * DS4_N_VOCAB;
+            memcpy(draft_row, s->draft_logits,
+                   (size_t)DS4_N_VOCAB * sizeof(float));
+            next = sample_temperature(
+                s->draft_logits, s->temperature, s->rng,
+                &s->draft_norm[draft_n]);
         }
         proposals[draft_n++] = next;
         if (draft_n + 1u < verify_rows && s->margin > 0.0f) {
-            draft_margin = qwen_mtp_gpu_topk_enabled() ? next_margin :
+            draft_margin = !stochastic && qwen_mtp_gpu_topk_enabled() ?
+                next_margin :
                 qwen_logits_top_margin(s->draft_logits);
         }
     }
@@ -3010,7 +3145,7 @@ static int qwen_mtp_spec_cycle(
     const bool snap = snapshot_elided ||
         qwen_graph_copy_recurrent_state(target, false);
     const double verify_t0 = timing ? now_sec() : 0.0;
-    const bool gpu_topk = qwen_mtp_gpu_topk_enabled();
+    const bool gpu_topk = !stochastic && qwen_mtp_gpu_topk_enabled();
     int target_top_ids[DS4_QWEN_SPEC_ROWS_MAX] = {0};
     bool ok = snap && qwen_graph_forward_chunk(
         target, s->target_model, s->target_weights, toks, pos, n_rows,
@@ -3036,19 +3171,40 @@ static int qwen_mtp_spec_cycle(
     uint32_t accepted_drafts = 0u;
     int target_next = -1;
     while (accepted_drafts < draft_n) {
-        target_next = gpu_topk ? target_top_ids[accepted_drafts] :
-            sample_argmax(
+        if (stochastic) {
+            bool proposal_accepted = false;
+            target_next = qwen_spec_sample(
                 s->spec_logits +
                     (uint64_t)accepted_drafts * DS4_N_VOCAB,
-                DS4_N_VOCAB);
-        if (target_next != proposals[accepted_drafts]) break;
+                s->draft_spec_logits +
+                    (uint64_t)accepted_drafts * DS4_N_VOCAB,
+                proposals[accepted_drafts],
+                s->draft_norm[accepted_drafts], s->temperature, s->rng,
+                &proposal_accepted);
+            if (!proposal_accepted) break;
+        } else {
+            target_next = gpu_topk ? target_top_ids[accepted_drafts] :
+                sample_argmax(
+                    s->spec_logits +
+                        (uint64_t)accepted_drafts * DS4_N_VOCAB,
+                    DS4_N_VOCAB);
+            if (target_next != proposals[accepted_drafts]) break;
+        }
         accepted_drafts++;
     }
     if (accepted_drafts == draft_n) {
-        target_next = gpu_topk ? target_top_ids[draft_n] :
-            sample_argmax(
+        target_next = stochastic ?
+            sample_temperature(
                 s->spec_logits + (uint64_t)draft_n * DS4_N_VOCAB,
-                DS4_N_VOCAB);
+                s->temperature, s->rng, NULL) :
+            (gpu_topk ? target_top_ids[draft_n] :
+             sample_argmax(
+                 s->spec_logits + (uint64_t)draft_n * DS4_N_VOCAB,
+                 DS4_N_VOCAB));
+    }
+    if (stochastic) {
+        s->pending_token = target_next;
+        s->have_pending_token = true;
     }
 
     const uint32_t n_committed = accepted_drafts + 1u;
@@ -3076,7 +3232,7 @@ static int qwen_mtp_spec_cycle(
         draft_ok = h && qwen_mtp_graph_step(
             draft, s->draft_model, s->draft_weights,
             h, proposals[i], pos + i + 1u, s->draft_min_pos,
-            NULL, NULL, NULL);
+            NULL, NULL, NULL, false);
         ds4_gpu_tensor_free(h);
     }
 
@@ -3091,7 +3247,7 @@ static int qwen_mtp_spec_cycle(
         draft_ok = h && qwen_mtp_graph_step(
             draft, s->draft_model, s->draft_weights,
             h, target_next, pos + n_committed, s->draft_min_pos,
-            s->draft_logits, &next_draft, &s->draft_margin);
+            s->draft_logits, &next_draft, &s->draft_margin, stochastic);
         fused_draft_encoded = fused_catchup && draft_ok;
         ds4_gpu_tensor_free(h);
     } else {
@@ -3103,8 +3259,16 @@ static int qwen_mtp_spec_cycle(
         draft_ok = draft_ok && end_ok;
         if (draft_ok && fused_draft_encoded) {
             draft_ok = qwen_mtp_graph_read_draft(
-                draft, s->draft_logits, &next_draft, &s->draft_margin);
+                draft, s->draft_logits, &next_draft, &s->draft_margin,
+                stochastic);
         }
+    }
+
+    if (draft_ok && stochastic) {
+        memcpy(s->draft_spec_logits, s->draft_logits,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+        next_draft = sample_temperature(
+            s->draft_logits, s->temperature, s->rng, &s->draft_norm[0]);
     }
 
     if (accepted_drafts == draft_n) {
@@ -3185,12 +3349,25 @@ static int qwen_mtp_spec_cycle(
 
 static void qwen_session_free(qwen_session *s) {
     if (!s) return;
+    free(s->draft_spec_logits);
     free(s->spec_logits);
     free(s->draft_logits);
     free(s->logits);
     qwen_mtp_graph_free(&s->mtp_graph);
     qwen_graph_free(&s->graph);
     memset(s, 0, sizeof(*s));
+}
+
+static void qwen_session_enable_sampling(qwen_session *s) {
+    if (!s->use_mtp) return;
+    if (!s->spec_logits) {
+        s->spec_logits = xmalloc(
+            (size_t)s->graph.spec_cap * DS4_N_VOCAB * sizeof(float));
+    }
+    if (!s->draft_spec_logits) {
+        s->draft_spec_logits = xmalloc(
+            (size_t)(s->graph.spec_cap - 1u) * DS4_N_VOCAB * sizeof(float));
+    }
 }
 
 static bool qwen_session_init(
@@ -3206,6 +3383,7 @@ static bool qwen_session_init(
     s->mtp_draft_tokens = mtp_draft_tokens;
     s->mtp_margin = mtp_margin;
     s->pending_token = -1;
+    s->rng_state = qwen_default_seed();
     s->use_mtp = mtp_model && mtp_weights && mtp_draft_tokens > 1 &&
         getenv("DS4_MTP_SPEC_DISABLE") == NULL;
 
@@ -3299,8 +3477,11 @@ static bool qwen_session_prefill(
 
 static int qwen_session_generate(
         qwen_session *s, const ds4_vocab *vocab, int n_predict,
-        int prefill_tokens, double prefill_s, ds4_token_emit_fn emit,
+        int prefill_tokens, double prefill_s, float temperature,
+        ds4_token_emit_fn emit,
         ds4_generation_done_fn done, void *emit_ud, int *generated_out) {
+    const bool stochastic = temperature > 0.0f;
+    if (stochastic) qwen_session_enable_sampling(s);
     qwen_mtp_state mtp = {
         .target = &s->graph,
         .draft = &s->mtp_graph,
@@ -3311,7 +3492,11 @@ static int qwen_session_generate(
         .logits = s->logits,
         .draft_logits = s->draft_logits,
         .spec_logits = s->spec_logits,
+        .draft_spec_logits = s->draft_spec_logits,
+        .temperature = temperature,
+        .rng = &s->rng_state,
         .draft_token = -1,
+        .pending_token = -1,
         .draft_tokens = s->mtp_draft_tokens,
         .margin = s->mtp_margin,
     };
@@ -3327,7 +3512,16 @@ static int qwen_session_generate(
             snprintf(label, sizeof(label), "Qwen3.6 step %d", n_generated);
             print_top_logits(stderr, label, vocab, s->logits, DS4_N_VOCAB, 10);
         }
-        const int token = sample_argmax(s->logits, DS4_N_VOCAB);
+        int token;
+        if (stochastic && mtp.have_pending_token) {
+            token = mtp.pending_token;
+            mtp.have_pending_token = false;
+        } else {
+            token = stochastic ?
+                sample_temperature(
+                    s->logits, temperature, &s->rng_state, NULL) :
+                sample_argmax(s->logits, DS4_N_VOCAB);
+        }
         if (token == vocab->eos_id) {
             s->pending_token = token;
             s->assistant_closed = true;
@@ -3401,23 +3595,25 @@ static int qwen_session_generate(
     return 0;
 }
 
-/* Prefill once, then feed each greedy token back through the persistent graph. */
-static int generate_qwen_metal_argmax(
+/* Prefill once, then feed sampled tokens through the persistent graph. */
+static int generate_qwen_metal(
         const ds4_model *model, const ds4_vocab *vocab,
         const ds4_weights *weights, const ds4_model *mtp_model,
         const ds4_qwen_mtp_weights *mtp_weights, int mtp_draft_tokens,
         float mtp_margin, const token_vec *prompt, int n_predict, int ctx_size,
+        float temperature, uint64_t seed,
         ds4_token_emit_fn emit, ds4_generation_done_fn done, void *emit_ud,
         ds4_session_progress_fn progress, void *progress_ud) {
     if (!prompt || prompt->len <= 0 || n_predict < 0) return 1;
     qwen_session s;
     if (!qwen_session_init(&s, model, weights, mtp_model, mtp_weights,
                            mtp_draft_tokens, mtp_margin, ctx_size)) return 1;
+    s.rng_state = seed;
     double prefill_s = 0.0;
     int rc = qwen_session_prefill(&s, prompt, progress, progress_ud,
                                   &prefill_s)
         ? qwen_session_generate(&s, vocab, n_predict, prompt->len, prefill_s,
-                                emit, done, emit_ud, NULL)
+                                temperature, emit, done, emit_ud, NULL)
         : 1;
     if (getenv("DS4_METAL_MEMORY_REPORT")) {
         ds4_gpu_print_memory_report("before Qwen3.6 graph free");
@@ -3725,6 +3921,7 @@ static void qwen_emit_text(void *ud, int token) {
 static int qwen_chat_turn(qwen_session *session, ds4_vocab *vocab,
                           const char *system, const char *user,
                           ds4_think_mode think_mode, int n_predict,
+                          float temperature,
                           ds4_token_emit_fn emit, ds4_generation_done_fn done,
                           void *emit_ud, int *prompt_tokens,
                           int *completion_tokens) {
@@ -3743,7 +3940,7 @@ static int qwen_chat_turn(qwen_session *session, ds4_vocab *vocab,
     double prefill_s = 0.0;
     int rc = qwen_session_prefill(session, &suffix, NULL, NULL, &prefill_s)
         ? qwen_session_generate(session, vocab, n_predict, suffix.len,
-                                prefill_s, emit, done, emit_ud,
+                                prefill_s, temperature, emit, done, emit_ud,
                                 completion_tokens)
         : 1;
     if (prompt_tokens) *prompt_tokens = suffix.len;
@@ -3760,11 +3957,13 @@ typedef struct {
 
 static int qwen_http_generate(
         void *ud, const qwen_chat_message *messages, size_t n_messages,
-        int max_tokens, bool think, qwen_text_emit_fn emit, void *emit_ud,
+        int max_tokens, bool think, float temperature, uint64_t seed,
+        qwen_text_emit_fn emit, void *emit_ud,
         qwen_http_stats *stats) {
     qwen_http_ctx *ctx = ud;
     if (!ctx->fresh && !qwen_session_reset(ctx->session)) return 1;
     ctx->fresh = false;
+    ctx->session->rng_state = seed;
     token_vec prompt = {0};
     if (ctx->system && ctx->system[0] &&
         (n_messages == 0 || strcmp(messages[0].role, "system"))) {
@@ -3784,8 +3983,8 @@ static int qwen_http_generate(
     int rc = qwen_session_prefill(ctx->session, &prompt, NULL, NULL,
                                   &prefill_s)
         ? qwen_session_generate(ctx->session, ctx->vocab, max_tokens,
-                                prompt.len, prefill_s, qwen_emit_text, NULL,
-                                &text, &generated)
+                                prompt.len, prefill_s, temperature,
+                                qwen_emit_text, NULL, &text, &generated)
         : 1;
     if (stats) {
         stats->prompt_tokens = prompt.len;
@@ -3798,11 +3997,12 @@ static int qwen_http_generate(
 
 static int qwen_interactive(qwen_session *session, ds4_vocab *vocab,
                             const char *system, const char *initial_prompt,
-                            ds4_think_mode think_mode, int n_predict) {
+                            ds4_think_mode think_mode, int n_predict,
+                            float temperature) {
     qwen_emit_ctx emit = {.vocab = vocab};
     if (initial_prompt && qwen_chat_turn(
             session, vocab, system, initial_prompt, think_mode, n_predict,
-            qwen_emit, qwen_done, &emit, NULL, NULL)) return 1;
+            temperature, qwen_emit, qwen_done, &emit, NULL, NULL)) return 1;
     const bool tty = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
     if (tty) {
         fprintf(stderr,
@@ -3839,7 +4039,7 @@ static int qwen_interactive(qwen_session *session, ds4_vocab *vocab,
             fflush(stdout);
         }
         if (qwen_chat_turn(session, vocab, system, line, think_mode,
-                           n_predict, qwen_emit, qwen_done, &emit,
+                           n_predict, temperature, qwen_emit, qwen_done, &emit,
                            NULL, NULL)) {
             free(line);
             return 1;
@@ -3857,8 +4057,10 @@ static void qwen_usage(const char *argv0) {
             "  ds4-server -m MODEL [--host HOST] [--port N] [options]\n"
             "\n"
             "options: -n TOKENS -c CONTEXT [-sys TEXT] "
-            "[--mtp MODEL --mtp-draft 2..16 [--mtp-margin N]]\n"
-            "         [--think|--nothink] [--interactive] [--server] "
+            "[--mtp MODEL [--mtp-draft 1..16] [--mtp-margin N]]\n"
+            "         [--temp N] [--seed N] [--think|--nothink] "
+            "[--interactive]\n"
+            "         [--server] "
             "[--cors]\n",
             argv0, argv0);
 }
@@ -3878,8 +4080,7 @@ static int qwen_acquire_instance_lock(void) {
     return fd;
 }
 
-/* The intentionally small CLI exposes only choices that do not replace the
- * optimized execution path: context, token budget, and think/no-think. */
+/* The intentionally small CLI exposes only the resident Metal execution path. */
 int main(int argc, char **argv) {
     const char *model_path = NULL;
     const char *mtp_path = NULL;
@@ -3891,6 +4092,9 @@ int main(int argc, char **argv) {
     int port = 8000;
     int mtp_draft_tokens = 1;
     float mtp_margin = 3.0f;
+    float temperature = 0.0f;
+    uint64_t seed = qwen_default_seed();
+    bool mtp_draft_explicit = false;
     ds4_think_mode think_mode = DS4_THINK_NONE;
     const char *program = strrchr(argv[0], '/');
     program = program ? program + 1 : argv[0];
@@ -3913,6 +4117,7 @@ int main(int argc, char **argv) {
             mtp_path = argv[++i];
         } else if (!strcmp(argv[i], "--mtp-draft") && i + 1 < argc) {
             mtp_draft_tokens = atoi(argv[++i]);
+            mtp_draft_explicit = true;
         } else if (!strcmp(argv[i], "--mtp-margin") && i + 1 < argc) {
             char *end = NULL;
             errno = 0;
@@ -3939,9 +4144,21 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--metal")) {
             /* Compatibility no-op: Metal is the only backend. */
         } else if (!strcmp(argv[i], "--temp") && i + 1 < argc) {
-            const char *temperature = argv[++i];
-            if (strcmp(temperature, "0") && strcmp(temperature, "0.0")) {
-                fprintf(stderr, "ds4: this minimal runtime supports greedy decoding only (--temp 0)\n");
+            char *end = NULL;
+            errno = 0;
+            temperature = strtof(argv[++i], &end);
+            if (errno || !end || *end != '\0' || temperature < 0.0f ||
+                temperature > 100.0f || !isfinite(temperature)) {
+                fprintf(stderr, "ds4: --temp must be between 0 and 100\n");
+                return 2;
+            }
+        } else if (!strcmp(argv[i], "--seed") && i + 1 < argc) {
+            char *end = NULL;
+            const char *value = argv[++i];
+            errno = 0;
+            seed = strtoull(value, &end, 10);
+            if (errno || value[0] == '-' || !end || *end != '\0') {
+                fprintf(stderr, "ds4: --seed must be an unsigned integer\n");
                 return 2;
             }
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
@@ -3953,6 +4170,7 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
+    if (mtp_path && !mtp_draft_explicit) mtp_draft_tokens = 3;
     if (!prompt_text && !server_mode) interactive = true;
     if (!model_path || n_predict < 0 || ctx_size <= 0 ||
         ctx_size > 262144 || mtp_draft_tokens < 1 || mtp_draft_tokens > 16 ||
@@ -4014,26 +4232,29 @@ int main(int argc, char **argv) {
                                mtp_draft_tokens, mtp_margin, ctx_size)) {
             rc = 1;
         } else if (server_mode) {
+            session.rng_state = seed;
             qwen_http_ctx http = {
                 .session = &session, .vocab = &vocab,
                 .system = system, .fresh = true,
             };
-            rc = qwen_http_serve(host, port, n_predict,
+            rc = qwen_http_serve(host, port, n_predict, temperature, seed,
                                  ds4_think_mode_enabled(think_mode), cors,
                                  qwen_http_generate, &http);
         } else {
+            session.rng_state = seed;
             rc = qwen_interactive(&session, &vocab, system, prompt_text,
-                                  think_mode, n_predict);
+                                  think_mode, n_predict, temperature);
         }
         qwen_session_free(&session);
     } else {
         qwen_emit_ctx emit = {.vocab = &vocab};
-        rc = generate_qwen_metal_argmax(
+        rc = generate_qwen_metal(
             &model, &vocab, &weights,
             mtp_path ? &mtp_model : NULL,
             mtp_path ? &mtp_weights : NULL,
             mtp_draft_tokens, mtp_margin, &prompt,
-            n_predict, ctx_size, qwen_emit, qwen_done, &emit, NULL, NULL);
+            n_predict, ctx_size, temperature, seed,
+            qwen_emit, qwen_done, &emit, NULL, NULL);
     }
     ds4_gpu_cleanup();
     token_vec_free(&prompt);

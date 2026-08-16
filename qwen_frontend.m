@@ -2,12 +2,15 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <math.h>
 #include <netdb.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include "qwen_frontend.h"
+
+static uint64_t request_seed_nonce;
 
 static bool send_all(int fd, const void *data, size_t len) {
     const uint8_t *p = data;
@@ -195,8 +198,8 @@ static bool read_request(int fd, NSString **method, NSString **path,
 
 static void handle_completion(
         int fd, NSString *path, NSData *body, int default_tokens,
-        bool default_think, bool cors, qwen_http_generate_fn generate,
-        void *generate_ud) {
+        float default_temperature, uint64_t default_seed, bool default_think,
+        bool cors, qwen_http_generate_fn generate, void *generate_ud) {
     id root = [NSJSONSerialization JSONObjectWithData:body options:0 error:nil];
     if (![root isKindOfClass:NSDictionary.class]) {
         error_reply(fd, 400, @"request body must be a JSON object", cors);
@@ -231,6 +234,25 @@ static void handle_completion(
     bool stream = [request[@"stream"] boolValue];
     bool think = request[@"think"] ? [request[@"think"] boolValue] :
         default_think;
+    id temperature_value = request[@"temperature"];
+    double temperature = temperature_value ?
+        [temperature_value doubleValue] : default_temperature;
+    if ((temperature_value &&
+         ![temperature_value isKindOfClass:NSNumber.class]) ||
+        !isfinite(temperature) || temperature < 0.0 || temperature > 100.0) {
+        error_reply(fd, 400, @"temperature must be between 0 and 100", cors);
+        return;
+    }
+    id seed_value = request[@"seed"];
+    long long signed_seed = seed_value ? [seed_value longLongValue] : 0;
+    if (seed_value &&
+        (![seed_value isKindOfClass:NSNumber.class] || signed_seed < 0 ||
+         [seed_value doubleValue] != (double)signed_seed)) {
+        error_reply(fd, 400, @"seed must be a non-negative integer", cors);
+        return;
+    }
+    uint64_t seed = seed_value ? (uint64_t)signed_seed :
+        default_seed + request_seed_nonce++;
 
     qwen_chat_message *native = calloc(messages.count, sizeof(*native));
     for (NSUInteger i = 0; i < messages.count; i++) {
@@ -247,7 +269,7 @@ static void handle_completion(
     if (stream) stream_headers(&sink);
     qwen_http_stats stats = {0};
     int rc = generate(generate_ud, native, messages.count, max_tokens, think,
-                      emit_text, &sink, &stats);
+                      (float)temperature, seed, emit_text, &sink, &stats);
     free(native);
     if (rc != 0) {
         if (!stream) error_reply(fd, 500, @"generation failed", cors);
@@ -289,6 +311,7 @@ static void handle_completion(
 }
 
 int qwen_http_serve(const char *host, int port, int default_tokens,
+                    float default_temperature, uint64_t default_seed,
                     bool default_think, bool cors,
                     qwen_http_generate_fn generate, void *generate_ud) {
     signal(SIGPIPE, SIG_IGN);
@@ -325,6 +348,7 @@ int qwen_http_serve(const char *host, int port, int default_tokens,
                        ([path isEqualToString:@"/v1/chat/completions"] ||
                         [path isEqualToString:@"/v1/completions"])) {
                 handle_completion(client, path, body, default_tokens,
+                                  default_temperature, default_seed,
                                   default_think, cors, generate, generate_ud);
             } else {
                 error_reply(client, 404, @"endpoint not found", cors);
