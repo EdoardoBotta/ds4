@@ -1,5 +1,4 @@
 #define FC_FLASH_ATTN_EXT_PAD 100
-#define FC_FLASH_ATTN_EXT_BLK 200
 #define FC_FLASH_ATTN_EXT 300
 #define FC_FLASH_ATTN_EXT_VEC 400
 #define FC_FLASH_ATTN_EXT_VEC_REDUCE 500
@@ -40,23 +39,6 @@ struct ds4_metal_args_flash_attn_ext_pad {
     uint64_t nb22;
     uint64_t nb23;
     uint64_t row21;
-    int32_t  ne31;
-    int32_t  ne32;
-    int32_t  ne33;
-    uint64_t nb31;
-    uint64_t nb32;
-    uint64_t nb33;
-};
-
-struct ds4_metal_args_flash_attn_ext_blk {
-    int32_t  ne01;
-    int32_t  ne30;
-    int32_t  ne31;
-    int32_t  ne32;
-    int32_t  ne33;
-    uint64_t nb31;
-    uint64_t nb32;
-    uint64_t nb33;
 };
 
 struct ds4_metal_args_flash_attn_ext {
@@ -92,6 +74,7 @@ struct ds4_metal_args_flash_attn_ext {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    int32_t  pos0;
 };
 
 struct ds4_metal_args_flash_attn_ext_vec {
@@ -127,22 +110,20 @@ struct ds4_metal_args_flash_attn_ext_vec {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    int32_t  pos0;
 };
 
 struct ds4_metal_args_flash_attn_ext_vec_reduce {
     int32_t nrows;
 };
 
-constant bool FC_flash_attn_ext_pad_has_mask [[function_constant(FC_FLASH_ATTN_EXT_PAD + 0)]];
 constant int32_t FC_flash_attn_ext_pad_ncpsg [[function_constant(FC_FLASH_ATTN_EXT_PAD + 25)]];
 
-// DS4 FlashAttention padding: pads the final partial K/V/mask cache block so the
-// vector FlashAttention kernel can read full 32-row chunks.
+// Pads the final partial K/V cache block for full-width vector loads.
 kernel void kernel_flash_attn_ext_pad(
         constant ds4_metal_args_flash_attn_ext_pad & args,
         device const char * k,
         device const char * v,
-        device const char * mask,
         device       char * dst,
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiitg[[thread_index_in_threadgroup]],
@@ -151,7 +132,6 @@ kernel void kernel_flash_attn_ext_pad(
 
     device char * k_pad    = dst;
     device char * v_pad    = k_pad + args.nb11*C*args.ne_12_2*args.ne_12_3;
-    device char * mask_pad = v_pad + args.nb21*C*args.ne_12_2*args.ne_12_3;
 
     const int32_t icp = args.ne11 % C;
     const int32_t ic0 = args.ne11 - icp;
@@ -184,77 +164,9 @@ kernel void kernel_flash_attn_ext_pad(
         }
     }
 
-    if (FC_flash_attn_ext_pad_has_mask) {
-        if (i2 < args.ne32 && i3 < args.ne33) {
-            for (int ib = i1; ib < args.ne31; ib += C) {
-                device const half * mask_src = (device const half *)(mask      + args.nb31*ib + args.nb32*i2 + args.nb33*i3) + ic0;
-                device       half * mask_dst = (device       half *)(mask_pad) + C*ib + C*args.ne31*i2 + C*args.ne31*args.ne32*i3;
-
-                for (int i = tiitg; i < C; i += ntg.x) {
-                    if (i >= icp) {
-                        mask_dst[i] = -MAXHALF;
-                    } else {
-                        mask_dst[i] = mask_src[i];
-                    }
-                }
-            }
-        }
-    }
 }
 
-constant int32_t FC_flash_attn_ext_blk_nqptg [[function_constant(FC_FLASH_ATTN_EXT_BLK + 24)]];
-constant int32_t FC_flash_attn_ext_blk_ncpsg [[function_constant(FC_FLASH_ATTN_EXT_BLK + 25)]];
-
-kernel void kernel_flash_attn_ext_blk(
-        constant ds4_metal_args_flash_attn_ext_blk & args,
-        device const char * mask,
-        device       char * dst,
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiisg[[thread_index_in_simdgroup]]) {
-    const int32_t Q = FC_flash_attn_ext_blk_nqptg;
-    const int32_t C = FC_flash_attn_ext_blk_ncpsg;
-    const int32_t i3 = tgpig[2]/args.ne32;
-    const int32_t i2 = tgpig[2]%args.ne32;
-    const int32_t i1 = tgpig[1];
-    const int32_t i0 = tgpig[0];
-    char res = i0*C + C > args.ne30 ? 1 : 0;
-
-    if ((C > N_SIMDWIDTH || Q > 1) && res == 0) {
-        half mmin =  MAXHALF;
-        half mmax = -MAXHALF;
-        const int32_t q0 = i1*Q;
-        FOR_UNROLL (short j = 0; j < Q; ++j) {
-            if (q0 + j < args.ne31) {
-                device const half * src =
-                    (device const half *)(mask + (q0 + j)*args.nb31 +
-                    i2*args.nb32 + i3*args.nb33) + i0*C + tiisg;
-                FOR_UNROLL (short ii = 0; ii < C/N_SIMDWIDTH; ++ii) {
-                    mmin = min(mmin, src[ii*N_SIMDWIDTH]);
-                    mmax = max(mmax, src[ii*N_SIMDWIDTH]);
-                }
-            }
-        }
-        mmin = simd_min(mmin);
-        mmax = simd_max(mmax);
-        if (mmax > -MAXHALF) {
-            res = mmin == 0.0 && mmax == 0.0 ? 2 : 1;
-        }
-    }
-
-    const int32_t nblk1 = (args.ne01 + Q - 1)/Q;
-    const int32_t nblk0 = (args.ne30 + C - 1)/C;
-    if (tiisg == 0) {
-        dst[((i3*args.ne32 + i2)*nblk1 + i1)*nblk0 + i0] = res;
-    }
-}
-
-constant bool FC_flash_attn_ext_has_mask  [[function_constant(FC_FLASH_ATTN_EXT + 0)]];
-constant bool FC_flash_attn_ext_has_sinks [[function_constant(FC_FLASH_ATTN_EXT + 1)]];
-constant bool FC_flash_attn_ext_has_bias  [[function_constant(FC_FLASH_ATTN_EXT + 2)]];
-constant bool FC_flash_attn_ext_has_scap  [[function_constant(FC_FLASH_ATTN_EXT + 3)]];
 constant bool FC_flash_attn_ext_has_kvpad [[function_constant(FC_FLASH_ATTN_EXT + 4)]];
-
-constant bool FC_flash_attn_ext_bc_mask [[function_constant(FC_FLASH_ATTN_EXT + 10)]];
 
 constant int32_t FC_flash_attn_ext_ns10 [[function_constant(FC_FLASH_ATTN_EXT + 20)]];
 constant int32_t FC_flash_attn_ext_ns20 [[function_constant(FC_FLASH_ATTN_EXT + 21)]];
@@ -298,10 +210,8 @@ void kernel_flash_attn_ext_impl(
         device const char * q,
         device const char * k,
         device const char * v,
-        device const char * mask,
-        device const char * sinks,
+        device const char * gate,
         device const char * pad,
-        device const char * blk,
         device       char * dst,
         threadgroup  half * shmem_f16,
         uint3   tgpig,
@@ -348,21 +258,6 @@ void kernel_flash_attn_ext_impl(
 
     threadgroup half2 * sm2 = (threadgroup half2 *) (shmem_f16 + Q*T + 2*C);
 
-    device const half2 * pm2[NQ];
-
-    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
-        const short j = jj*NSG + sgitg;
-
-        pm2[jj] = (device const half2 *) ((device const char *) mask + (iq1 + j)*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
-    }
-
-    {
-        const int32_t nblk1 = ((args.ne01 + Q - 1)/Q);
-        const int32_t nblk0 = ((args.ne11 + C - 1)/C);
-
-        blk += (((iq3%args.ne33)*args.ne32 + (iq2%args.ne32))*nblk1 + iq1/Q)*nblk0;
-    }
-
     {
         q += iq1*args.nb01 + iq2*args.nb02 + iq3*args.nb03;
 
@@ -406,27 +301,16 @@ void kernel_flash_attn_ext_impl(
     {
         float M[NQ] = { [0 ... NQ-1] = -FLT_MAX/2 };
 
-        float slope = 1.0f;
-
-        if (FC_flash_attn_ext_has_bias) {
-            const short h = iq2;
-
-            const float base = h < args.n_head_log2 ? args.m0 : args.m1;
-            const short exph = h < args.n_head_log2 ? h + 1 : 2*(h - args.n_head_log2) + 1;
-
-            slope = pow(base, exph);
-        }
-
         for (int ic0 = 0; ; ++ic0) {
-            int ic = ic0*C;
-            if (ic >= args.ne11) {
+            const int block_base = ic0*C;
+            int ic = block_base;
+            if (block_base >= args.ne11) {
                 break;
             }
 
-            if (FC_flash_attn_ext_has_kvpad && ic + C > args.ne11) {
+            if (FC_flash_attn_ext_has_kvpad && block_base + C > args.ne11) {
                 k    = pad;
                 v    = k + args.nb11*C*args.ne_12_2*args.ne_12_3;
-                mask = v + args.nb21*C*args.ne_12_2*args.ne_12_3;
 
                 const short ikv2 = iq2/(args.ne02/args.ne_12_2);
                 const short ikv3 = iq3/(args.ne03/args.ne_12_3);
@@ -434,61 +318,27 @@ void kernel_flash_attn_ext_impl(
                 k += (ikv2 + ikv3*args.ne_12_2)*args.nb11*C;
                 v += (ikv2 + ikv3*args.ne_12_2)*args.nb21*C;
 
-                if (!FC_flash_attn_ext_has_mask) {
-                    threadgroup half * sm = (threadgroup half *) (sm2);
-
-                    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
-                        const short j = jj*NSG + sgitg;
-
-                        for (short i = tiisg; i < C; i += NW) {
-                            if (ic + i >= args.ne11) {
-                                sm[2*j*SH + i] = -MAXHALF;
-                            }
-                        }
-                    }
-                } else {
-                    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
-                        const short j = jj*NSG + sgitg;
-
-                        pm2[jj] = (device const half2 *) ((device const half *) mask +
-                                (iq1 + j)*C +
-                                (iq2%args.ne32)*(C*args.ne31) +
-                                (iq3%args.ne33)*(C*args.ne31*args.ne32));
-                    }
-                }
-
                 ic = 0;
             }
 
             char blk_cur = 1;
 
-            if (FC_flash_attn_ext_has_mask) {
-                blk_cur = blk[ic0];
-
-                if (blk_cur == 0) {
-                    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
-                        pm2[jj] += NW;
-                    }
-
-                    continue;
-                }
-
-                if (blk_cur == 1) {
-                    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
-                        const short j = jj*NSG + sgitg;
-
-                        if (FC_flash_attn_ext_bc_mask) {
-                            sm2[j*SH + tiisg] = (iq1 + j) < args.ne31 ? pm2[jj][tiisg] : half2(-MAXHALF, -MAXHALF);
-                        } else {
-                            sm2[j*SH + tiisg] = pm2[jj][tiisg];
-                        }
-
-                        pm2[jj] += NW;
-                    }
-                } else if (blk_cur == 2) {
-                    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
-                        pm2[jj] += NW;
-                    }
+            const int first_qpos = args.pos0 + iq1;
+            const int last_qrow = min((int)args.ne01 - 1, (int)iq1 + Q - 1);
+            if (block_base > args.pos0 + last_qrow) {
+                continue;
+            }
+            if (block_base + C - 1 <= first_qpos) {
+                blk_cur = 2;
+            } else {
+                FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+                    const short j = jj*NSG + sgitg;
+                    const int qpos = args.pos0 + iq1 + j;
+                    const int key0 = block_base + 2*tiisg;
+                    sm2[j*SH + tiisg] = (iq1 + j) < args.ne01
+                        ? half2(key0 <= qpos ? 0.0h : -MAXHALF,
+                                key0 + 1 <= qpos ? 0.0h : -MAXHALF)
+                        : half2(-MAXHALF, -MAXHALF);
                 }
             }
 
@@ -617,16 +467,8 @@ void kernel_flash_attn_ext_impl(
 
                 float2 s2 = ss2[j*SH/2 + tiisg]*args.scale;
 
-                if (FC_flash_attn_ext_has_scap) {
-                    s2 = args.logit_softcap*precise::tanh(s2);
-                }
-
                 if (blk_cur != 2) {
-                    if (FC_flash_attn_ext_has_bias) {
-                        s2 += s2_t(sm2[j*SH + tiisg])*slope;
-                    } else {
-                        s2 += s2_t(sm2[j*SH + tiisg]);
-                    }
+                    s2 += s2_t(sm2[j*SH + tiisg]);
                 }
 
                 M[jj] = simd_max(max(M[jj], max(s2[0], s2[1])));
@@ -798,25 +640,6 @@ void kernel_flash_attn_ext_impl(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
-        if (FC_flash_attn_ext_has_sinks) {
-            FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
-                const short j = jj*NSG + sgitg;
-
-                const float m = M[jj];
-                const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
-
-                M[jj] = simd_max(max(M[jj], s));
-
-                const float ms = exp(m - M[jj]);
-                const float vs = exp(s - M[jj]);
-
-                S[jj] = S[jj]*ms + simd_sum(vs);
-
-                for (short i = tiisg; i < DV4; i += NW) {
-                    so4[j*PV4 + i] *= ms;
-                }
-            }
-        }
     }
 
     for (short jj = 0; jj < NQ; ++jj) {
@@ -829,7 +652,7 @@ void kernel_flash_attn_ext_impl(
             (uint64_t)iq3*args.ne2*args.ne1 + iq2 +
             (uint64_t)(iq1 + j)*args.ne1;
         device float4 * dst4 = (device float4 *) dst + row*DV4;
-        device const float4 * gate4 = (device const float4 *) sinks + row*DV4;
+        device const float4 * gate4 = (device const float4 *)gate + row*DV4;
 
         const float scale = S[jj] == 0.0 ? 0.0f : 1.0f/S[jj];
 
@@ -858,9 +681,7 @@ void kernel_flash_attn_ext_impl(
 #undef NS20
 }
 
-// Batched FlashAttention for prompt/prefill rows. It computes QK, applies mask,
-// sinks, ALiBi/softcap options when enabled, and multiplies by V without
-// materializing the full attention matrix.
+// Batched causal FlashAttention for Qwen prompt and speculative rows.
 template<
     typename q_t,
     typename q4_t,
@@ -895,17 +716,15 @@ kernel void kernel_flash_attn_ext(
         device const char * q,
         device const char * k,
         device const char * v,
-        device const char * mask,
-        device const char * sinks,
+        device const char * gate,
         device const char * pad,
-        device const char * blk,
         device       char * dst,
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
 #define FWD_TMPL q_t, q4_t, q8x8_t, k_t, k4x4_t, k8x8_t, v_t, v4x4_t, v8x8_t, qk_t, qk8x8_t, s_t, s2_t, s8x8_t, o_t, o4_t, o8x8_t, kd4x4_t, nl_k, deq_k, vd4x4_t, nl_v, deq_v, DK, DV, Q, C, APPLY_GATE
-#define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, dst, shmem_f16, tgpig, tiisg, sgitg
+#define FWD_ARGS args, q, k, v, gate, pad, dst, shmem_f16, tgpig, tiisg, sgitg
     switch (FC_flash_attn_ext_nsg) {
         case 4: kernel_flash_attn_ext_impl<FWD_TMPL, 4>(FWD_ARGS); break;
         case 8: kernel_flash_attn_ext_impl<FWD_TMPL, 8>(FWD_ARGS); break;

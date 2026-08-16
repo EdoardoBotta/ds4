@@ -104,9 +104,7 @@ static id g_model_residency_set;
 
 static id<MTLBuffer> g_flash_attn_pad_buffer;
 static id<MTLBuffer> g_flash_attn_tmp_buffer;
-static id<MTLBuffer> g_flash_attn_blk_buffer;
 static id<MTLBuffer> g_flash_attn_kv_buffer;
-static id<MTLBuffer> g_glm_flash_attn_mask_buffer;
 static id<MTLBuffer> g_indexer_topk_buffer;
 static int g_model_fd = -1;
 static const void *g_model_map_ptr;
@@ -145,13 +143,7 @@ static int ds4_gpu_model_map_log_enabled(void);
 
 static NSUInteger g_flash_attn_pad_bytes;
 static NSUInteger g_flash_attn_tmp_bytes;
-static NSUInteger g_flash_attn_blk_bytes;
 static NSUInteger g_flash_attn_kv_bytes;
-static NSUInteger g_glm_flash_attn_mask_bytes;
-static uint32_t g_glm_flash_attn_mask_pos0;
-static uint32_t g_glm_flash_attn_mask_tokens;
-static uint32_t g_glm_flash_attn_mask_cache_len;
-static int g_glm_flash_attn_mask_valid;
 static NSUInteger g_indexer_topk_bytes;
 static int g_initialized;
 static int g_quality_mode;
@@ -1550,7 +1542,6 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_ext_pipeline(
 }
 
 static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pad_pipeline(
-        bool    has_mask,
         int32_t ncpsg) {
     /*
      * Decode calls this once per layer with identical arguments, so memoize
@@ -1559,28 +1550,26 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pad_pipeline(
      * The rollback switch restores the dictionary path for same-binary A/B.
      */
     static struct {
-        bool m;
         int32_t nc;
         id<MTLComputePipelineState> pipeline;
     } memo;
     const bool memo_disabled =
         getenv("DS4_METAL_DISABLE_PRE_M5_FLASH_ATTN_PAD_BLK_MEMO") != NULL;
-    if (!memo_disabled && memo.pipeline && memo.m == has_mask && memo.nc == ncpsg) {
+    if (!memo_disabled && memo.pipeline && memo.nc == ncpsg) {
         return memo.pipeline;
     }
 
-    NSString *key = [NSString stringWithFormat:@"kernel_flash_attn_ext_pad_mask=%d_ncpsg=%d",
-                     has_mask ? 1 : 0, (int)ncpsg];
+    NSString *key = [NSString stringWithFormat:@"kernel_flash_attn_ext_pad_ncpsg=%d",
+                     (int)ncpsg];
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
     if (cached) {
         if (!memo_disabled) {
-            memo = (typeof(memo)){ has_mask, ncpsg, cached };
+            memo = (typeof(memo)){ ncpsg, cached };
         }
         return cached;
     }
 
     MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
-    [constants setConstantValue:&has_mask type:MTLDataTypeBool atIndex:100];
     [constants setConstantValue:&ncpsg type:MTLDataTypeInt atIndex:125];
 
     NSError *error = nil;
@@ -1603,67 +1592,14 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pad_pipeline(
 
     [g_pipeline_cache setObject:pipeline forKey:key];
     if (!memo_disabled) {
-        memo = (typeof(memo)){ has_mask, ncpsg, pipeline };
+        memo = (typeof(memo)){ ncpsg, pipeline };
     }
-    return pipeline;
-}
-
-static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_blk_pipeline(
-        int32_t nqptg,
-        int32_t ncpsg) {
-    static struct {
-        int32_t nq;
-        int32_t nc;
-        id<MTLComputePipelineState> pipeline;
-    } memo;
-    if (memo.pipeline && memo.nq == nqptg && memo.nc == ncpsg) {
-        return memo.pipeline;
-    }
-
-    NSString *key = [NSString stringWithFormat:@"kernel_flash_attn_ext_blk_nqptg=%d_ncpsg=%d",
-                     (int)nqptg, (int)ncpsg];
-    id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
-    if (cached) {
-        memo = (typeof(memo)){ nqptg, ncpsg, cached };
-        return cached;
-    }
-
-    MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
-    [constants setConstantValue:&nqptg type:MTLDataTypeInt atIndex:224];
-    [constants setConstantValue:&ncpsg type:MTLDataTypeInt atIndex:225];
-
-    NSError *error = nil;
-    id<MTLFunction> fn = [g_library newFunctionWithName:@"kernel_flash_attn_ext_blk"
-                                         constantValues:constants
-                                                  error:&error];
-    if (!fn) {
-        fprintf(stderr, "ds4: Metal kernel_flash_attn_ext_blk function not found: %s\n",
-                [[error localizedDescription] UTF8String]);
-        return nil;
-    }
-
-    error = nil;
-    id<MTLComputePipelineState> pipeline =
-        [g_device newComputePipelineStateWithFunction:fn error:&error];
-    if (!pipeline) {
-        fprintf(stderr, "ds4: Metal kernel_flash_attn_ext_blk pipeline failed: %s\n",
-                [[error localizedDescription] UTF8String]);
-        return nil;
-    }
-
-    [g_pipeline_cache setObject:pipeline forKey:key];
-    memo = (typeof(memo)){ nqptg, ncpsg, pipeline };
     return pipeline;
 }
 
 static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pipeline(
         const char *function_name,
-        bool        has_mask,
-        bool        has_sinks,
-        bool        has_bias,
-        bool        has_scap,
         bool        has_kvpad,
-        bool        bc_mask,
         int32_t     ns10,
         int32_t     ns20,
         int32_t     nsg) {
@@ -1676,7 +1612,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pipeline(
      */
     static struct {
         const char *fn;
-        bool m, s, b, c, k, bc;
+        bool k;
         int32_t n10, n20, sg;
         id<MTLComputePipelineState> pipeline;
     } memo;
@@ -1684,40 +1620,28 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pipeline(
         getenv("DS4_METAL_DISABLE_PRE_M5_FLASH_ATTN_BATCHED_MEMO") != NULL;
     if (!memo_disabled && memo.pipeline && memo.fn != NULL &&
         strcmp(memo.fn, function_name) == 0 &&
-        memo.m == has_mask && memo.s == has_sinks && memo.b == has_bias &&
-        memo.c == has_scap && memo.k == has_kvpad && memo.bc == bc_mask &&
+        memo.k == has_kvpad &&
         memo.n10 == ns10 && memo.n20 == ns20 && memo.sg == nsg) {
         return memo.pipeline;
     }
 
-    NSString *key = [NSString stringWithFormat:@"%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_bcm=%d_ns10=%d_ns20=%d_nsg=%d",
+    NSString *key = [NSString stringWithFormat:@"%s_kvpad=%d_ns10=%d_ns20=%d_nsg=%d",
                      function_name,
-                     has_mask ? 1 : 0,
-                     has_sinks ? 1 : 0,
-                     has_bias ? 1 : 0,
-                     has_scap ? 1 : 0,
                      has_kvpad ? 1 : 0,
-                     bc_mask ? 1 : 0,
                      (int)ns10,
                      (int)ns20,
                      (int)nsg];
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
     if (cached) {
         if (!memo_disabled) {
-            memo = (typeof(memo)){ function_name, has_mask, has_sinks, has_bias,
-                                   has_scap, has_kvpad, bc_mask, ns10, ns20,
+            memo = (typeof(memo)){ function_name, has_kvpad, ns10, ns20,
                                    nsg, cached };
         }
         return cached;
     }
 
     MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
-    [constants setConstantValue:&has_mask  type:MTLDataTypeBool atIndex:300];
-    [constants setConstantValue:&has_sinks type:MTLDataTypeBool atIndex:301];
-    [constants setConstantValue:&has_bias  type:MTLDataTypeBool atIndex:302];
-    [constants setConstantValue:&has_scap  type:MTLDataTypeBool atIndex:303];
     [constants setConstantValue:&has_kvpad type:MTLDataTypeBool atIndex:304];
-    [constants setConstantValue:&bc_mask   type:MTLDataTypeBool atIndex:310];
     [constants setConstantValue:&ns10 type:MTLDataTypeInt atIndex:320];
     [constants setConstantValue:&ns20 type:MTLDataTypeInt atIndex:321];
     [constants setConstantValue:&nsg  type:MTLDataTypeInt atIndex:322];
@@ -1743,8 +1667,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pipeline(
 
     [g_pipeline_cache setObject:pipeline forKey:key];
     if (!memo_disabled) {
-        memo = (typeof(memo)){ function_name, has_mask, has_sinks, has_bias,
-                               has_scap, has_kvpad, bc_mask, ns10, ns20,
+        memo = (typeof(memo)){ function_name, has_kvpad, ns10, ns20,
                                nsg, pipeline };
     }
     return pipeline;
@@ -1942,9 +1865,7 @@ void ds4_gpu_print_memory_report(const char *label) {
 
     const uint64_t scratch = (uint64_t)g_flash_attn_pad_bytes +
         (uint64_t)g_flash_attn_tmp_bytes +
-        (uint64_t)g_flash_attn_blk_bytes +
         (uint64_t)g_flash_attn_kv_bytes +
-        (uint64_t)g_glm_flash_attn_mask_bytes +
         (uint64_t)g_indexer_topk_bytes;
     fprintf(stderr,
             "ds4: Metal memory%s%s: live %.2f MiB, peak %.2f MiB, "
@@ -2455,24 +2376,7 @@ typedef struct {
     uint64_t nb22;
     uint64_t nb23;
     uint64_t row21;
-    int32_t  ne31;
-    int32_t  ne32;
-    int32_t  ne33;
-    uint64_t nb31;
-    uint64_t nb32;
-    uint64_t nb33;
 } ds4_gpu_flash_attn_pad_args;
-
-typedef struct {
-    int32_t  ne01;
-    int32_t  ne30;
-    int32_t  ne31;
-    int32_t  ne32;
-    int32_t  ne33;
-    uint64_t nb31;
-    uint64_t nb32;
-    uint64_t nb33;
-} ds4_gpu_flash_attn_blk_args;
 
 typedef struct {
     int32_t  ne01;
@@ -2507,6 +2411,7 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    int32_t  pos0;
 } ds4_gpu_flash_attn_vec_args;
 
 typedef struct {
@@ -4408,49 +4313,6 @@ static int ds4_gpu_encode_cpy_f16_f16_3d(
     return 1;
 }
 
-static id<MTLBuffer> ds4_gpu_qwen_prefill_mask_buffer(
-        uint32_t pos0,
-        uint32_t n_tokens,
-        uint32_t cache_len) {
-    const NSUInteger mask_bytes =
-        (NSUInteger)n_tokens * cache_len * sizeof(uint16_t);
-    const bool same_shape =
-        g_glm_flash_attn_mask_valid &&
-        g_glm_flash_attn_mask_buffer &&
-        g_glm_flash_attn_mask_bytes >= mask_bytes &&
-        g_glm_flash_attn_mask_pos0 == pos0 &&
-        g_glm_flash_attn_mask_tokens == n_tokens &&
-        g_glm_flash_attn_mask_cache_len == cache_len;
-    if (same_shape) return g_glm_flash_attn_mask_buffer;
-
-    if (g_glm_flash_attn_mask_buffer) {
-        [g_transient_buffers addObject:g_glm_flash_attn_mask_buffer];
-        g_glm_flash_attn_mask_buffer = nil;
-    }
-    g_glm_flash_attn_mask_bytes = 0;
-    g_glm_flash_attn_mask_valid = 0;
-    if (!ds4_gpu_ensure_scratch_buffer(&g_glm_flash_attn_mask_buffer,
-                                        &g_glm_flash_attn_mask_bytes,
-                                        mask_bytes,
-                                        "ds4_qwen_flash_attn_mask")) {
-        return nil;
-    }
-
-    uint16_t *mask = (uint16_t *)[g_glm_flash_attn_mask_buffer contents];
-    for (uint32_t q = 0; q < n_tokens; q++) {
-        const uint32_t qpos = pos0 + q;
-        uint16_t *row = mask + (uint64_t)q * cache_len;
-        for (uint32_t k = 0; k < cache_len; k++) {
-            row[k] = k <= qpos ? 0u : 0xfc00u;
-        }
-    }
-    g_glm_flash_attn_mask_pos0 = pos0;
-    g_glm_flash_attn_mask_tokens = n_tokens;
-    g_glm_flash_attn_mask_cache_len = cache_len;
-    g_glm_flash_attn_mask_valid = 1;
-    return g_glm_flash_attn_mask_buffer;
-}
-
 /* Rectangular causal/window + compressed-key visibility mask: q covers rows
  * [q_row0, q_row0 + n_q) of an n_tokens-token chunk whose raw keys all stay
  * resident, followed by n_comp compressed keys.  The square prefill case is
@@ -4819,7 +4681,7 @@ static int ds4_gpu_qwen35_attention_flash_decode_tensor(
     }
 
     id<MTLComputePipelineState> pad_pipeline = has_kvpad
-        ? ds4_gpu_get_flash_attn_pad_pipeline(false, (int32_t)ncpsg) : nil;
+        ? ds4_gpu_get_flash_attn_pad_pipeline((int32_t)ncpsg) : nil;
     id<MTLComputePipelineState> vec_pipeline =
         ds4_gpu_get_flash_attn_vec_pipeline(
             "kernel_qwen35_flash_attn_ext_vec_f16_dk256_dv256",
@@ -4852,20 +4714,13 @@ static int ds4_gpu_qwen35_attention_flash_decode_tensor(
             .nb22 = row_bytes_f16,
             .nb23 = (uint64_t)cache_cap * cache_row_stride,
             .row21 = row_bytes_f16,
-            .ne31 = 1,
-            .ne32 = 1,
-            .ne33 = 1,
-            .nb31 = 0,
-            .nb32 = 0,
-            .nb33 = 0,
         };
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:pad_pipeline];
         [enc setBytes:&pad_args length:sizeof(pad_args) atIndex:0];
         [enc setBuffer:keybuf offset:ds4_gpu_tensor_offset(key_cache) atIndex:1];
         [enc setBuffer:valbuf offset:ds4_gpu_tensor_offset(value_cache) atIndex:2];
-        [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:3];
-        [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:4];
+        [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake(ncpsg, n_head_kv, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -5712,7 +5567,6 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
         const uint32_t ncpsg = 64;
         const uint32_t nsg = 4;
         const bool has_kvpad = (cache_len % ncpsg) != 0;
-        const bool bc_mask = (n_tokens % nqptg) != 0;
         const NSUInteger q_row_bytes = (NSUInteger)qk_dim * sizeof(float);
         const NSUInteger q_row_bytes_f16 = (NSUInteger)qk_dim * sizeof(uint16_t);
         const NSUInteger v_row_bytes_f16 = (NSUInteger)value_dim * sizeof(uint16_t);
@@ -5751,45 +5605,29 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
             ? (int32_t)(n_head_kv * qk_dim) : (int32_t)qk_dim;
         const int32_t attn_ns20 = direct_kv
             ? (int32_t)(n_head_kv * value_dim) : (int32_t)value_dim;
-        const NSUInteger mask_bytes =
-            (NSUInteger)n_tokens * cache_len * sizeof(uint16_t);
         const NSUInteger pad_bytes = has_kvpad
-            ? 2u * (NSUInteger)ncpsg * attn_kv_row_stride * n_head_kv +
-              (NSUInteger)ncpsg * n_tokens * sizeof(uint16_t)
+            ? 2u * (NSUInteger)ncpsg * attn_kv_row_stride * n_head_kv
             : 1u;
-        const NSUInteger nblk0 = ((NSUInteger)cache_len + ncpsg - 1u) / ncpsg;
         const NSUInteger nblk1 = ((NSUInteger)n_tokens + nqptg - 1u) / nqptg;
-        const NSUInteger blk_bytes = ds4_gpu_align_up_ns(nblk0 * nblk1, 32u);
-        id<MTLBuffer> mask_buffer =
-            ds4_gpu_qwen_prefill_mask_buffer(pos0, n_tokens, cache_len);
-        if (!mask_buffer) return 0;
         if (!ds4_gpu_ensure_scratch_buffer(&g_flash_attn_pad_buffer,
                                              &g_flash_attn_pad_bytes,
                                              pad_bytes,
-                                             "ds4_glm_flash_attn_pad") ||
-            !ds4_gpu_ensure_scratch_buffer(&g_flash_attn_blk_buffer,
-                                             &g_flash_attn_blk_bytes,
-                                             blk_bytes,
-                                             "ds4_glm_flash_attn_blk")) {
+                                             "ds4_glm_flash_attn_pad")) {
             return 0;
         }
 
         id<MTLComputePipelineState> pad_pipeline = nil;
         if (has_kvpad) {
-            pad_pipeline = ds4_gpu_get_flash_attn_pad_pipeline(true, (int32_t)ncpsg);
+            pad_pipeline = ds4_gpu_get_flash_attn_pad_pipeline((int32_t)ncpsg);
             if (!pad_pipeline) return 0;
         }
-        id<MTLComputePipelineState> blk_pipeline =
-            ds4_gpu_get_flash_attn_blk_pipeline((int32_t)nqptg, (int32_t)ncpsg);
         id<MTLComputePipelineState> attn_pipeline =
             ds4_gpu_get_flash_attn_pipeline(fuse_gate
                                               ? "kernel_flash_attn_ext_f16_dk256_dv256"
                                               : "kernel_flash_attn_ext_f16_dk256_dv256_nogate",
-                                              true, false, false, false, has_kvpad, bc_mask,
-                                              attn_ns10,
-                                              attn_ns20,
+                                              has_kvpad, attn_ns10, attn_ns20,
                                               (int32_t)nsg);
-        if (!blk_pipeline || !attn_pipeline) return 0;
+        if (!attn_pipeline) return 0;
 
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -5825,12 +5663,6 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
                 .nb22 = attn_value_head_stride,
                 .nb23 = (uint64_t)cache_cap * attn_kv_row_stride,
                 .row21 = v_row_bytes_f16,
-                .ne31 = (int32_t)n_tokens,
-                .ne32 = 1,
-                .ne33 = 1,
-                .nb31 = (uint64_t)cache_len * sizeof(uint16_t),
-                .nb32 = mask_bytes,
-                .nb33 = mask_bytes,
             };
 
             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
@@ -5838,33 +5670,14 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
             [enc setBytes:&pad_args length:sizeof(pad_args) atIndex:0];
             [enc setBuffer:attn_keybuf offset:attn_key_offset atIndex:1];
             [enc setBuffer:attn_valbuf offset:attn_value_offset atIndex:2];
-            [enc setBuffer:mask_buffer offset:0 atIndex:3];
-            [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:4];
+            [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:3];
             [enc dispatchThreadgroups:MTLSizeMake(ncpsg, n_head_kv, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
         }
 
-        ds4_gpu_flash_attn_blk_args blk_args = {
-            .ne01 = (int32_t)n_tokens,
-            .ne30 = (int32_t)cache_len,
-            .ne31 = (int32_t)n_tokens,
-            .ne32 = 1,
-            .ne33 = 1,
-            .nb31 = (uint64_t)cache_len * sizeof(uint16_t),
-            .nb32 = mask_bytes,
-            .nb33 = mask_bytes,
-        };
-        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:blk_pipeline];
-        [enc setBytes:&blk_args length:sizeof(blk_args) atIndex:0];
-        [enc setBuffer:mask_buffer offset:0 atIndex:1];
-        [enc setBuffer:g_flash_attn_blk_buffer offset:0 atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(nblk0, nblk1, 1)
-             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-        ds4_gpu_end_compute_encoder(cb, enc);
-
         ds4_gpu_flash_attn_vec_args args = {
+            .pos0 = (int32_t)pos0,
             .ne01 = (int32_t)n_tokens,
             .ne02 = (int32_t)n_head,
             .ne03 = 1,
@@ -5882,12 +5695,6 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
             .nb21 = attn_kv_row_stride,
             .nb22 = attn_value_head_stride,
             .nb23 = (uint64_t)cache_cap * attn_kv_row_stride,
-            .ne31 = (int32_t)n_tokens,
-            .ne32 = 1,
-            .ne33 = 1,
-            .nb31 = (uint64_t)cache_len * sizeof(uint16_t),
-            .nb32 = mask_bytes,
-            .nb33 = mask_bytes,
             .ne1 = (int32_t)n_head,
             .ne2 = (int32_t)n_tokens,
             .ne3 = 1,
@@ -5904,19 +5711,17 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
             ((NSUInteger)qk_dim + 2u * padded_v + 2u * (2u * (NSUInteger)ncpsg));
         const NSUInteger shared_bytes = ds4_gpu_align_up_ns(shared_elems * (sizeof(float) / 2u), 16u);
 
-        enc = ds4_gpu_compute_encoder(cb);
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:attn_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
         [enc setBuffer:attn_keybuf offset:attn_key_offset atIndex:2];
         [enc setBuffer:attn_valbuf offset:attn_value_offset atIndex:3];
-        [enc setBuffer:mask_buffer offset:0 atIndex:4];
         [enc setBuffer:fuse_gate ? gatebuf : qbuf
                 offset:fuse_gate ? ds4_gpu_tensor_offset(gate)
-                                 : ds4_gpu_tensor_offset(q) atIndex:5];
-        [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:6];
-        [enc setBuffer:g_flash_attn_blk_buffer offset:0 atIndex:7];
-        [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:8];
+                                 : ds4_gpu_tensor_offset(q) atIndex:4];
+        [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:5];
+        [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:6];
         [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(nblk1, n_head, 1)
              threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
