@@ -2,19 +2,21 @@
 
 This branch is an educational extraction of the production Qwen3.6 27B path.
 It keeps the mmap GGUF loader, Qwen3.6 NextN speculative decoding, and the
-existing optimized Metal backend, but removes the server, agent, distributed
-runtimes, other GPU backends, other model families, and the general-purpose
-engine API.
+existing optimized Metal backend. A small persistent chat loop and serial
+OpenAI-compatible server are retained; the general server/agent framework,
+distributed runtimes, other GPU backends, other model families, and the
+general-purpose engine API are removed.
 
 The intended reading order is:
 
-1. `qwen36.c`: GGUF parsing, fixed-shape validation, tokenizer, target and MTP
-   graph storage, prefill/speculative-decode scheduling, and the small CLI.
-2. `ds4_gpu.h`: the C interface exposed by the Metal backend.
-3. `ds4_metal.m`: Metal buffers, command encoding, pipeline selection, and
+1. `qwen36.c`: GGUF parsing, tokenizer, persistent target/MTP sessions,
+   prefill/speculative-decode scheduling, and the small CLI.
+2. `qwen_frontend.m`: the minimal HTTP and OpenAI JSON boundary.
+3. `ds4_gpu.h`: the C interface exposed by the Metal backend.
+4. `ds4_metal.m`: Metal buffers, command encoding, pipeline selection, and
    model mmap residency.
-4. `metal/qwen35.metal`: Qwen full-attention and Gated DeltaNet kernels.
-5. Shared kernels in `metal/dense.metal`, `metal/flash_attn.metal`,
+5. `metal/qwen35.metal`: Qwen full-attention and Gated DeltaNet kernels.
+6. Shared kernels in `metal/dense.metal`, `metal/flash_attn.metal`,
    `metal/norm.metal`, and `metal/glu.metal`.
 
 ## The inference path
@@ -48,6 +50,8 @@ Unexpected GGUF metadata or tensor layouts fail early.
 - Prefill keeps fused residual-add/RMSNorm enabled.
 - Pre-M5 Apple Silicon uses an F16 FFN intermediate to reduce bandwidth.
 - Decode keeps persistent KV, convolution, and recurrent SSM state on GPU.
+- Interactive turns append only their new chat-template suffix to that state;
+  the HTTP server reuses the same allocated graph between serial requests.
 - The optional Qwen3.6 NextN model drafts one token ahead; the target verifies
   a short suffix in one multi-row graph dispatch.
 - Speculative verification can perform top-k on GPU, elide the recurrent-state
@@ -95,6 +99,38 @@ DS4_QWEN_MTP_FUSED_CATCHUP=1 \
 Metal and greedy decoding are the only backend and sampler. `--metal` and
 `--temp 0` remain accepted so existing baseline commands still work.
 
+### Interactive session
+
+Omit `-p` (or add `--interactive`) to keep the model, Metal graph, KV cache,
+and Gated DeltaNet state resident across turns. `/reset` starts a new context
+and `/quit` exits. Speculative decoding uses the same options as one-shot mode.
+
+```sh
+./ds4 \
+  -m gguf/Qwen3.6-27B-Q8_0.gguf \
+  --mtp gguf/mtp-Qwen3.6-27B-Q8_0.gguf --mtp-draft 3 \
+  -n 256 -c 32768 --nothink
+```
+
+### Inference server
+
+`make` also creates `ds4-server`, a symlink to the same binary. The compact
+server keeps one graph resident and processes requests serially, which keeps
+the state machine visible and peak single-request Qwen performance unchanged.
+It implements health/model discovery plus OpenAI non-streaming and SSE APIs at
+`/v1/chat/completions` and `/v1/completions`.
+
+```sh
+./ds4-server \
+  -m gguf/Qwen3.6-27B-Q8_0.gguf \
+  --mtp gguf/mtp-Qwen3.6-27B-Q8_0.gguf --mtp-draft 3 \
+  -n 256 -c 32768 --host 127.0.0.1 --port 8000
+
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"stream":true}'
+```
+
 Useful diagnostic/ablation variables are:
 
 - `DS4_METAL_MEMORY_REPORT=1`: print Metal memory accounting.
@@ -132,25 +168,25 @@ a deterministic live-model smoke test.
 
 The original default macOS CLI compiled 159023 implementation lines: 132228
 lines of C/Objective-C plus 26795 lines of runtime-compiled Metal. This branch
-compiles 16211: 3798 in the Qwen host, 6094 in the Qwen-only Metal backend, and
-6319 in its nine runtime-compiled shader files. The public GPU header is another
-442 lines, down from 3196.
+compiles 16796: 4383 in the Qwen host and frontends, 6094 in the Qwen-only Metal
+backend, and 6319 in its nine runtime-compiled shader files. The public GPU
+header is another 442 lines, down from 3196.
 
 | Surface | Before | After | Removed |
 |---|---:|---:|---:|
-| Main host engine | 70897 | 3798 | 67099 (94.6%) |
+| Main host engine + frontends | 70897 | 4383 | 66514 (93.8%) |
 | Metal host backend | 44603 | 6094 | 38509 (86.3%) |
 | Runtime Metal shaders | 26795 | 6319 | 20476 (76.4%) |
-| Compiled implementation | 159023 | 16211 | 142812 (89.8%) |
+| Compiled implementation | 159023 | 16796 | 142227 (89.4%) |
 
 The repository also loses millions of lines of generated experiment fixtures,
 but those are not counted as inference-engine simplification.
 
 Removed features include DeepSeek and GLM execution, CUDA/ROCm/CPU backends,
-server and agent frontends, SSD streaming, tensor parallelism, distributed
-execution, eval/benchmark products, and optional support-model speculative
-decoding for other model families. The retained Qwen target and NextN paths
-use the same hot graphs and Metal kernels as the original.
+the general concurrent server and agent frontends, SSD streaming, tensor
+parallelism, distributed execution, eval/benchmark products, and optional
+support-model speculative decoding for other model families. The retained Qwen
+target and NextN paths use the same hot graphs and Metal kernels as the original.
 
 Final validation used the saved pre-prune binary and this branch on an Apple M4
 Pro. Every comparison used the same Q8_0 files and peak MTP settings; measured
@@ -162,6 +198,10 @@ ordinary and speculative outputs were identical.
 | Ordinary generation, 3 alternating-run median | 5.48 tok/s | 5.63 tok/s | +2.7% |
 | MTP total cycle, 37-cycle median | 395.087 ms | 373.319 ms | -5.5% |
 
+An additional alternating A/B after restoring the frontends compared this
+branch with its immediately preceding commit: ordinary generation differed by
+-0.5% and MTP generation by +0.9%, both within run-to-run noise.
+
 The absolute throughput varied with mmap residency pressure, so the decode
 gate also compares the per-cycle medians within a longer run. The reduced
 runtime did not lose peak prefill, ordinary decode, or speculative performance.
@@ -169,7 +209,8 @@ runtime did not lose peak prefill, ordinary decode, or speculative performance.
 ## Scope
 
 This is a focused inference example, not a drop-in replacement for the full
-product. It supports one prompt, Qwen's think/no-think chat prefix, greedy
-streaming output, one resident Metal target, and an optional matching NextN
-support model. That narrow contract is what makes the control flow readable
-without replacing optimized kernels with toy implementations.
+product. It supports one-shot and persistent chat, a serial OpenAI-compatible
+HTTP boundary, Qwen's think/no-think prefix, greedy streaming output, one
+resident Metal target, and an optional matching NextN support model. That
+narrow contract keeps the control flow readable without replacing optimized
+kernels with toy implementations.

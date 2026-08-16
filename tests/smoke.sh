@@ -2,6 +2,12 @@
 set -eu
 
 ./ds4 --help >/dev/null 2>&1
+./ds4-server --help >/dev/null 2>&1
+
+if [ ! -L ./ds4-server ]; then
+    echo "smoke: ds4-server compatibility entry point is missing" >&2
+    exit 1
+fi
 
 if ./ds4 --temp 0.7 -m unused.gguf -p unused >/dev/null 2>&1; then
     echo "smoke: non-greedy temperature was unexpectedly accepted" >&2
@@ -10,6 +16,11 @@ fi
 
 if ./ds4 --mtp-draft 2 -m unused.gguf -p unused >/dev/null 2>&1; then
     echo "smoke: speculative decoding was accepted without --mtp" >&2
+    exit 1
+fi
+
+if ./ds4 --server -m unused.gguf -p unused >/dev/null 2>&1; then
+    echo "smoke: server mode unexpectedly accepted a one-shot prompt" >&2
     exit 1
 fi
 

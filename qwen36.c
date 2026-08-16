@@ -3,8 +3,8 @@
  * This is a deliberately narrow, vertical runtime: mmap a Q8_0 GGUF, parse
  * its tokenizer and weights, construct the persistent Qwen graph, prefill in
  * chunks, and decode greedily. The optimized Metal backend is kept intact;
- * only unrelated model families, frontends, and host execution paths were
- * removed.
+ * only unrelated model families, general frontends, and host execution paths
+ * were removed.
  */
 
 #include <errno.h>
@@ -31,6 +31,7 @@
 
 #include "ds4.h"
 #include "ds4_gpu.h"
+#include "qwen_frontend.h"
 
 #define DS4_NEG_INF (-1.0e30f)
 
@@ -1714,23 +1715,6 @@ static void print_top_logits(
     }
 }
 
-static int generate_qwen_metal_argmax(
-        const ds4_model   * model,
-        const ds4_vocab   * vocab,
-        const ds4_weights * weights,
-        const ds4_model   * mtp_model,
-        const ds4_qwen_mtp_weights *mtp_weights,
-        int                 mtp_draft_tokens,
-        float               mtp_margin,
-        const token_vec   * prompt,
-        int                 n_predict,
-        int                 ctx_size,
-        ds4_token_emit_fn   emit,
-        ds4_generation_done_fn done,
-        void              * emit_ud,
-        ds4_session_progress_fn progress,
-        void              * progress_ud);
-
 bool ds4_think_mode_enabled(ds4_think_mode mode) {
     return mode == DS4_THINK_HIGH || mode == DS4_THINK_MAX;
 }
@@ -1818,6 +1802,27 @@ typedef struct {
     ds4_gpu_tensor *conv_spec_final[DS4_MAX_LAYER];
     ds4_gpu_tensor *ssm_spec_final[DS4_MAX_LAYER];
 } ds4_qwen_gpu_graph;
+
+/* A session owns the resident graph and the small host buffers used by both
+ * one-shot and multi-turn decoding. Metal kernels and their scheduling stay
+ * identical; interactive turns only append to the existing state. */
+typedef struct {
+    const ds4_model *model;
+    const ds4_weights *weights;
+    const ds4_model *mtp_model;
+    const ds4_qwen_mtp_weights *mtp_weights;
+    ds4_qwen_gpu_graph graph;
+    ds4_qwen_mtp_graph mtp_graph;
+    float *logits;
+    float *draft_logits;
+    float *spec_logits;
+    uint32_t pos;
+    int mtp_draft_tokens;
+    float mtp_margin;
+    int pending_token;
+    bool assistant_closed;
+    bool use_mtp;
+} qwen_session;
 
 static void qwen_graph_free(ds4_qwen_gpu_graph *g) {
     if (!g) return;
@@ -3178,147 +3183,174 @@ static int qwen_mtp_spec_cycle(
     return (int)n_committed;
 }
 
-/* Prefill once, then feed each greedy token back through the persistent graph. */
-static int generate_qwen_metal_argmax(
-        const ds4_model   * model,
-        const ds4_vocab   * vocab,
-        const ds4_weights * weights,
-        const ds4_model   * mtp_model,
-        const ds4_qwen_mtp_weights *mtp_weights,
-        int                 mtp_draft_tokens,
-        float               mtp_margin,
-        const token_vec   * prompt,
-        int                 n_predict,
-        int                 ctx_size,
-        ds4_token_emit_fn   emit,
-        ds4_generation_done_fn done,
-        void              * emit_ud,
-        ds4_session_progress_fn progress,
-        void              * progress_ud) {
+static void qwen_session_free(qwen_session *s) {
+    if (!s) return;
+    free(s->spec_logits);
+    free(s->draft_logits);
+    free(s->logits);
+    qwen_mtp_graph_free(&s->mtp_graph);
+    qwen_graph_free(&s->graph);
+    memset(s, 0, sizeof(*s));
+}
+
+static bool qwen_session_init(
+        qwen_session *s, const ds4_model *model, const ds4_weights *weights,
+        const ds4_model *mtp_model, const ds4_qwen_mtp_weights *mtp_weights,
+        int mtp_draft_tokens, float mtp_margin, int ctx_size) {
     fprintf(stderr, "ds4: using Qwen3.6 resident Metal generation path\n");
-
-    if (!prompt || prompt->len <= 0 || prompt->len > ctx_size) {
-        fprintf(stderr, "ds4: prompt is empty or exceeds context size\n");
-        return 1;
-    }
-    if (n_predict <= 0) {
-        if (done) done(emit_ud);
-        return 0;
-    }
-    if (prompt->len >= ctx_size) {
-        fprintf(stderr, "ds4: prompt leaves no context room for generation\n");
-        return 1;
-    }
-
-    const bool use_mtp = mtp_model && mtp_weights && mtp_draft_tokens > 1 &&
+    memset(s, 0, sizeof(*s));
+    s->model = model;
+    s->weights = weights;
+    s->mtp_model = mtp_model;
+    s->mtp_weights = mtp_weights;
+    s->mtp_draft_tokens = mtp_draft_tokens;
+    s->mtp_margin = mtp_margin;
+    s->pending_token = -1;
+    s->use_mtp = mtp_model && mtp_weights && mtp_draft_tokens > 1 &&
         getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+
     uint32_t prefill_cap = qwen_runtime_prefill_cap();
     const uint32_t spec_rows = qwen_mtp_spec_rows(mtp_draft_tokens);
-    if (use_mtp && prefill_cap < spec_rows) prefill_cap = spec_rows;
-
-    ds4_qwen_gpu_graph g = {0};
-    ds4_qwen_mtp_graph mtp_graph = {0};
-    if (!qwen_graph_alloc(&g, (uint32_t)ctx_size, prefill_cap)) {
+    if (s->use_mtp && prefill_cap < spec_rows) prefill_cap = spec_rows;
+    if (!qwen_graph_alloc(&s->graph, (uint32_t)ctx_size, prefill_cap)) {
         fprintf(stderr, "ds4: failed to allocate Qwen3.6 graph runtime\n");
-        return 1;
+        return false;
     }
-    if (use_mtp &&
-        (!qwen_graph_enable_mtp(&g, spec_rows) ||
-         !qwen_mtp_graph_alloc(&mtp_graph, (uint32_t)ctx_size))) {
+    if (s->use_mtp &&
+        (!qwen_graph_enable_mtp(&s->graph, spec_rows) ||
+         !qwen_mtp_graph_alloc(&s->mtp_graph, (uint32_t)ctx_size))) {
         fprintf(stderr, "ds4: failed to allocate Qwen3.6 MTP runtime\n");
-        qwen_mtp_graph_free(&mtp_graph);
-        qwen_graph_free(&g);
-        return 1;
+        qwen_session_free(s);
+        return false;
     }
-    const bool memory_report = getenv("DS4_METAL_MEMORY_REPORT") != NULL;
-    if (memory_report) ds4_gpu_print_memory_report("after Qwen3.6 graph alloc");
-
-    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
-    float *draft_logits = use_mtp ?
+    s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    s->draft_logits = s->use_mtp ?
         xmalloc((size_t)DS4_N_VOCAB * sizeof(float)) : NULL;
-    float *spec_logits = use_mtp && !qwen_mtp_gpu_topk_enabled() ?
+    s->spec_logits = s->use_mtp && !qwen_mtp_gpu_topk_enabled() ?
         xmalloc((size_t)spec_rows * DS4_N_VOCAB * sizeof(float)) : NULL;
-    const double t_prefill0 = now_sec();
-    const bool batched_prefill = qwen_batched_prefill_enabled();
-    for (int i = 0; i < prompt->len; ) {
-        uint32_t chunk = 1u;
-        if (batched_prefill && prompt->len - i > 1) {
-            chunk = (uint32_t)(prompt->len - i);
-            if (chunk > g.prefill_cap) chunk = g.prefill_cap;
+    if (getenv("DS4_METAL_MEMORY_REPORT")) {
+        ds4_gpu_print_memory_report("after Qwen3.6 graph alloc");
+    }
+    return true;
+}
+
+/* KV rows are overwritten from position zero; only Gated DeltaNet's recurrent
+ * state must be cleared for a fresh, independent server request. */
+static bool qwen_session_reset(qwen_session *s) {
+    const uint64_t conv_elems =
+        (uint64_t)(2u * DS4_N_GDN_QK_HEAD + DS4_N_GDN_V_HEAD) *
+        DS4_N_GDN_STATE * (DS4_N_GDN_CONV - 1u);
+    const uint64_t state_elems =
+        (uint64_t)DS4_N_GDN_V_HEAD * DS4_N_GDN_STATE * DS4_N_GDN_STATE;
+    const uint32_t n = DS4_N_LAYER - DS4_N_LAYER / DS4_N_FULL_ATTN_INTERVAL;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!ds4_gpu_tensor_fill_f32(s->graph.conv_state[i], 0.0f, conv_elems) ||
+            !ds4_gpu_tensor_fill_f32(s->graph.ssm_state[i], 0.0f, state_elems)) {
+            return false;
         }
-        const bool last = i + (int)chunk == prompt->len;
-        const bool step_ok = chunk > 1u
-            ? qwen_graph_forward_chunk(&g, model, weights,
-                                       prompt->v + i, (uint32_t)i, chunk,
-                                       false, last ? logits : NULL,
-                                       NULL, NULL)
-            : qwen_graph_forward_token(&g, model, weights,
-                                       (uint32_t)prompt->v[i], (uint32_t)i,
-                                       last ? logits : NULL);
-        if (!step_ok) {
-            fprintf(stderr, "ds4: Qwen3.6 prefill failed at position %d\n", i);
-            free(spec_logits);
-            free(draft_logits);
-            free(logits);
-            qwen_mtp_graph_free(&mtp_graph);
-            qwen_graph_free(&g);
-            return 1;
+    }
+    s->pos = 0;
+    s->pending_token = -1;
+    s->assistant_closed = false;
+    return true;
+}
+
+static bool qwen_session_prefill(
+        qwen_session *s, const token_vec *tokens,
+        ds4_session_progress_fn progress, void *progress_ud,
+        double *elapsed) {
+    if (!tokens || tokens->len <= 0 ||
+        (uint64_t)s->pos + (uint64_t)tokens->len >= s->graph.ctx_cap) {
+        fprintf(stderr, "ds4: prompt is empty or leaves no context room\n");
+        return false;
+    }
+    const uint32_t base = s->pos;
+    const double t0 = now_sec();
+    const bool batched = qwen_batched_prefill_enabled();
+    for (int i = 0; i < tokens->len; ) {
+        uint32_t chunk = 1u;
+        if (batched && tokens->len - i > 1) {
+            chunk = (uint32_t)(tokens->len - i);
+            if (chunk > s->graph.prefill_cap) chunk = s->graph.prefill_cap;
+        }
+        const bool last = i + (int)chunk == tokens->len;
+        const bool ok = chunk > 1u
+            ? qwen_graph_forward_chunk(
+                  &s->graph, s->model, s->weights, tokens->v + i, base + i,
+                  chunk, false, last ? s->logits : NULL, NULL, NULL)
+            : qwen_graph_forward_token(
+                  &s->graph, s->model, s->weights, (uint32_t)tokens->v[i],
+                  base + (uint32_t)i, last ? s->logits : NULL);
+        if (!ok) {
+            fprintf(stderr, "ds4: Qwen3.6 prefill failed at position %u\n",
+                    base + (uint32_t)i);
+            return false;
         }
         i += (int)chunk;
-        if (progress) progress(progress_ud, "prefill_chunk", i, prompt->len);
+        if (progress) progress(progress_ud, "prefill_chunk", i, tokens->len);
     }
-    const double t_prefill1 = now_sec();
-    if (memory_report) ds4_gpu_print_memory_report("after Qwen3.6 prefill");
+    s->pos += (uint32_t)tokens->len;
+    if (elapsed) *elapsed = now_sec() - t0;
+    if (getenv("DS4_METAL_MEMORY_REPORT")) {
+        ds4_gpu_print_memory_report("after Qwen3.6 prefill");
+    }
+    return true;
+}
 
+static int qwen_session_generate(
+        qwen_session *s, const ds4_vocab *vocab, int n_predict,
+        int prefill_tokens, double prefill_s, ds4_token_emit_fn emit,
+        ds4_generation_done_fn done, void *emit_ud, int *generated_out) {
     qwen_mtp_state mtp = {
-        .target = &g,
-        .draft = &mtp_graph,
-        .target_model = model,
-        .target_weights = weights,
-        .draft_model = mtp_model,
-        .draft_weights = mtp_weights,
-        .logits = logits,
-        .draft_logits = draft_logits,
-        .spec_logits = spec_logits,
+        .target = &s->graph,
+        .draft = &s->mtp_graph,
+        .target_model = s->model,
+        .target_weights = s->weights,
+        .draft_model = s->mtp_model,
+        .draft_weights = s->mtp_weights,
+        .logits = s->logits,
+        .draft_logits = s->draft_logits,
+        .spec_logits = s->spec_logits,
         .draft_token = -1,
-        .draft_tokens = mtp_draft_tokens,
-        .margin = mtp_margin,
+        .draft_tokens = s->mtp_draft_tokens,
+        .margin = s->mtp_margin,
     };
     int n_generated = 0;
-    uint32_t pos = (uint32_t)prompt->len;
     const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
-    const double t_decode0 = now_sec();
+    const double t0 = now_sec();
     bool stop = false;
-    while (n_generated < n_predict && pos < g.ctx_cap && !stop) {
-        if (getenv("DS4_TRACE_TOP") != NULL) {
+    s->pending_token = -1;
+    s->assistant_closed = false;
+    while (n_generated < n_predict && s->pos < s->graph.ctx_cap && !stop) {
+        if (getenv("DS4_TRACE_TOP")) {
             char label[64];
             snprintf(label, sizeof(label), "Qwen3.6 step %d", n_generated);
-            print_top_logits(stderr, label, vocab, logits, DS4_N_VOCAB, 10);
+            print_top_logits(stderr, label, vocab, s->logits, DS4_N_VOCAB, 10);
         }
-        const int token = sample_argmax(logits, DS4_N_VOCAB);
-        if (token == vocab->eos_id) break;
-        if (use_mtp) {
+        const int token = sample_argmax(s->logits, DS4_N_VOCAB);
+        if (token == vocab->eos_id) {
+            s->pending_token = token;
+            s->assistant_closed = true;
+            break;
+        }
+        if (s->use_mtp) {
             int accepted[DS4_QWEN_SPEC_ROWS_MAX];
             int cap = n_predict - n_generated;
             if (cap > (int)DS4_QWEN_SPEC_ROWS_MAX) {
                 cap = (int)DS4_QWEN_SPEC_ROWS_MAX;
             }
             const int ntok = qwen_mtp_spec_cycle(
-                &mtp, pos, token, vocab->eos_id, accepted, cap);
+                &mtp, s->pos, token, vocab->eos_id, accepted, cap);
             if (ntok < 0) {
                 fprintf(stderr,
                         "ds4: Qwen3.6 speculative decode failed at position %u\n",
-                        pos);
-                free(spec_logits);
-                free(draft_logits);
-                free(logits);
-                qwen_mtp_graph_free(&mtp_graph);
-                qwen_graph_free(&g);
+                        s->pos);
                 return 1;
             }
-            pos += (uint32_t)ntok;
+            s->pos += (uint32_t)ntok;
             for (int i = 0; i < ntok; i++) {
                 if (accepted[i] == vocab->eos_id) {
+                    s->assistant_closed = true;
                     stop = true;
                     break;
                 }
@@ -3329,35 +3361,33 @@ static int generate_qwen_metal_argmax(
         } else {
             if (emit) emit(emit_ud, token);
             n_generated++;
-            if (n_generated >= n_predict || pos + 1u >= g.ctx_cap) break;
-            const double t_eval0 = token_timing ? now_sec() : 0.0;
-            if (!qwen_graph_forward_token(&g, model, weights,
-                                          (uint32_t)token, pos, logits)) {
-                fprintf(stderr,
-                        "ds4: Qwen3.6 decode failed at position %u\n", pos);
-                free(logits);
-                qwen_graph_free(&g);
+            if (n_generated >= n_predict || s->pos + 1u >= s->graph.ctx_cap) {
+                s->pending_token = token;
+                break;
+            }
+            const double eval0 = token_timing ? now_sec() : 0.0;
+            if (!qwen_graph_forward_token(
+                    &s->graph, s->model, s->weights,
+                    (uint32_t)token, s->pos, s->logits)) {
+                fprintf(stderr, "ds4: Qwen3.6 decode failed at position %u\n",
+                        s->pos);
                 return 1;
             }
             if (token_timing) {
-                const double t_eval1 = now_sec();
-                fprintf(stderr,
-                        "ds4: Qwen3.6 decode eval %d took %.3f ms\n",
-                        n_generated, (t_eval1 - t_eval0) * 1000.0);
+                fprintf(stderr, "ds4: Qwen3.6 decode eval %d took %.3f ms\n",
+                        n_generated, (now_sec() - eval0) * 1000.0);
             }
-            pos++;
+            s->pos++;
         }
     }
-    const double t_decode1 = now_sec();
+    const double decode_s = now_sec() - t0;
     if (done) done(emit_ud);
-
-    const double prefill_s = t_prefill1 - t_prefill0;
-    const double decode_s = t_decode1 - t_decode0;
+    if (generated_out) *generated_out = n_generated;
     ds4_log(stderr, DS4_LOG_TIMING,
             "ds4: Qwen3.6 prefill: %.2f t/s, generation: %.2f t/s\n",
-            prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
+            prefill_s > 0.0 ? (double)prefill_tokens / prefill_s : 0.0,
             decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
-    if (use_mtp && mtp.cycles != 0 && mtp.proposed != 0 &&
+    if (s->use_mtp && mtp.cycles && mtp.proposed &&
         (getenv("DS4_QWEN_MTP_STATS") || getenv("DS4_QWEN_MTP_TIMING"))) {
         fprintf(stderr,
                 "ds4: Qwen3.6 MTP stats cycles=%llu proposed=%llu accepted=%llu "
@@ -3368,14 +3398,32 @@ static int generate_qwen_metal_argmax(
                 100.0 * (double)mtp.accepted / (double)mtp.proposed,
                 (unsigned long long)(mtp.cycles + mtp.accepted));
     }
-
-    if (memory_report) ds4_gpu_print_memory_report("before Qwen3.6 graph free");
-    free(spec_logits);
-    free(draft_logits);
-    free(logits);
-    qwen_mtp_graph_free(&mtp_graph);
-    qwen_graph_free(&g);
     return 0;
+}
+
+/* Prefill once, then feed each greedy token back through the persistent graph. */
+static int generate_qwen_metal_argmax(
+        const ds4_model *model, const ds4_vocab *vocab,
+        const ds4_weights *weights, const ds4_model *mtp_model,
+        const ds4_qwen_mtp_weights *mtp_weights, int mtp_draft_tokens,
+        float mtp_margin, const token_vec *prompt, int n_predict, int ctx_size,
+        ds4_token_emit_fn emit, ds4_generation_done_fn done, void *emit_ud,
+        ds4_session_progress_fn progress, void *progress_ud) {
+    if (!prompt || prompt->len <= 0 || n_predict < 0) return 1;
+    qwen_session s;
+    if (!qwen_session_init(&s, model, weights, mtp_model, mtp_weights,
+                           mtp_draft_tokens, mtp_margin, ctx_size)) return 1;
+    double prefill_s = 0.0;
+    int rc = qwen_session_prefill(&s, prompt, progress, progress_ud,
+                                  &prefill_s)
+        ? qwen_session_generate(&s, vocab, n_predict, prompt->len, prefill_s,
+                                emit, done, emit_ud, NULL)
+        : 1;
+    if (getenv("DS4_METAL_MEMORY_REPORT")) {
+        ds4_gpu_print_memory_report("before Qwen3.6 graph free");
+    }
+    qwen_session_free(&s);
+    return rc;
 }
 typedef struct {
     ds4_vocab *vocab;
@@ -3587,21 +3635,19 @@ static void qwen_tokenize(const ds4_vocab *vocab, const char *text,
     qwen_bpe_tokenize_text(vocab, text, 1, out);
 }
 
-static void qwen_encode_prompt(const ds4_vocab *vocab, const char *system,
-                               const char *prompt, ds4_think_mode think_mode,
-                               token_vec *out) {
-    if (system && system[0]) {
-        token_vec_push(out, vocab->system_id);
-        qwen_tokenize(vocab, "system\n", out);
-        qwen_tokenize(vocab, system, out);
-        token_vec_push(out, vocab->eos_id);
-        qwen_tokenize(vocab, "\n", out);
-    }
+static void qwen_encode_message(const ds4_vocab *vocab, const char *role,
+                                const char *text, token_vec *out) {
     token_vec_push(out, vocab->user_id);
-    qwen_tokenize(vocab, "user\n", out);
-    qwen_tokenize(vocab, prompt, out);
+    qwen_tokenize(vocab, role, out);
+    qwen_tokenize(vocab, "\n", out);
+    qwen_tokenize(vocab, text, out);
     token_vec_push(out, vocab->eos_id);
     qwen_tokenize(vocab, "\n", out);
+}
+
+static void qwen_encode_assistant_prefix(const ds4_vocab *vocab,
+                                         ds4_think_mode think_mode,
+                                         token_vec *out) {
     token_vec_push(out, vocab->assistant_id);
     qwen_tokenize(vocab, "assistant\n", out);
     token_vec_push(out, vocab->think_start_id);
@@ -3611,6 +3657,16 @@ static void qwen_encode_prompt(const ds4_vocab *vocab, const char *system,
         token_vec_push(out, vocab->think_end_id);
         qwen_tokenize(vocab, "\n\n", out);
     }
+}
+
+static void qwen_encode_prompt(const ds4_vocab *vocab, const char *system,
+                               const char *prompt, ds4_think_mode think_mode,
+                               token_vec *out) {
+    if (system && system[0]) {
+        qwen_encode_message(vocab, "system", system, out);
+    }
+    qwen_encode_message(vocab, "user", prompt, out);
+    qwen_encode_assistant_prefix(vocab, think_mode, out);
 }
 
 static char *qwen_token_text(ds4_vocab *vocab, int token, size_t *len) {
@@ -3652,12 +3708,159 @@ static void qwen_done(void *ud) {
     fputc('\n', stdout);
 }
 
+typedef struct {
+    ds4_vocab *vocab;
+    qwen_text_emit_fn emit;
+    void *emit_ud;
+} qwen_text_emit_ctx;
+
+static void qwen_emit_text(void *ud, int token) {
+    qwen_text_emit_ctx *ctx = ud;
+    size_t len = 0;
+    char *text = qwen_token_text(ctx->vocab, token, &len);
+    ctx->emit(ctx->emit_ud, text, len);
+    free(text);
+}
+
+static int qwen_chat_turn(qwen_session *session, ds4_vocab *vocab,
+                          const char *system, const char *user,
+                          ds4_think_mode think_mode, int n_predict,
+                          ds4_token_emit_fn emit, ds4_generation_done_fn done,
+                          void *emit_ud, int *prompt_tokens,
+                          int *completion_tokens) {
+    token_vec suffix = {0};
+    if (session->pos == 0) {
+        qwen_encode_prompt(vocab, system, user, think_mode, &suffix);
+    } else {
+        if (session->pending_token >= 0) {
+            token_vec_push(&suffix, session->pending_token);
+        }
+        if (!session->assistant_closed) token_vec_push(&suffix, vocab->eos_id);
+        qwen_tokenize(vocab, "\n", &suffix);
+        qwen_encode_message(vocab, "user", user, &suffix);
+        qwen_encode_assistant_prefix(vocab, think_mode, &suffix);
+    }
+    double prefill_s = 0.0;
+    int rc = qwen_session_prefill(session, &suffix, NULL, NULL, &prefill_s)
+        ? qwen_session_generate(session, vocab, n_predict, suffix.len,
+                                prefill_s, emit, done, emit_ud,
+                                completion_tokens)
+        : 1;
+    if (prompt_tokens) *prompt_tokens = suffix.len;
+    token_vec_free(&suffix);
+    return rc;
+}
+
+typedef struct {
+    qwen_session *session;
+    ds4_vocab *vocab;
+    const char *system;
+    bool fresh;
+} qwen_http_ctx;
+
+static int qwen_http_generate(
+        void *ud, const qwen_chat_message *messages, size_t n_messages,
+        int max_tokens, bool think, qwen_text_emit_fn emit, void *emit_ud,
+        qwen_http_stats *stats) {
+    qwen_http_ctx *ctx = ud;
+    if (!ctx->fresh && !qwen_session_reset(ctx->session)) return 1;
+    ctx->fresh = false;
+    token_vec prompt = {0};
+    if (ctx->system && ctx->system[0] &&
+        (n_messages == 0 || strcmp(messages[0].role, "system"))) {
+        qwen_encode_message(ctx->vocab, "system", ctx->system, &prompt);
+    }
+    for (size_t i = 0; i < n_messages; i++) {
+        qwen_encode_message(ctx->vocab, messages[i].role,
+                            messages[i].content, &prompt);
+    }
+    qwen_encode_assistant_prefix(ctx->vocab,
+        think ? DS4_THINK_HIGH : DS4_THINK_NONE, &prompt);
+    double prefill_s = 0.0;
+    qwen_text_emit_ctx text = {
+        .vocab = ctx->vocab, .emit = emit, .emit_ud = emit_ud,
+    };
+    int generated = 0;
+    int rc = qwen_session_prefill(ctx->session, &prompt, NULL, NULL,
+                                  &prefill_s)
+        ? qwen_session_generate(ctx->session, ctx->vocab, max_tokens,
+                                prompt.len, prefill_s, qwen_emit_text, NULL,
+                                &text, &generated)
+        : 1;
+    if (stats) {
+        stats->prompt_tokens = prompt.len;
+        stats->completion_tokens = generated;
+        stats->stopped = ctx->session->assistant_closed;
+    }
+    token_vec_free(&prompt);
+    return rc;
+}
+
+static int qwen_interactive(qwen_session *session, ds4_vocab *vocab,
+                            const char *system, const char *initial_prompt,
+                            ds4_think_mode think_mode, int n_predict) {
+    qwen_emit_ctx emit = {.vocab = vocab};
+    if (initial_prompt && qwen_chat_turn(
+            session, vocab, system, initial_prompt, think_mode, n_predict,
+            qwen_emit, qwen_done, &emit, NULL, NULL)) return 1;
+    const bool tty = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
+    if (tty) {
+        fprintf(stderr,
+                "ds4: interactive session (/reset starts over, /quit exits)\n");
+    }
+    char *line = NULL;
+    size_t cap = 0;
+    for (;;) {
+        if (tty) {
+            fputs("user> ", stdout);
+            fflush(stdout);
+        }
+        ssize_t n = getline(&line, &cap, stdin);
+        if (n < 0) break;
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) {
+            line[--n] = '\0';
+        }
+        if (!strcmp(line, "/quit") || !strcmp(line, "/exit")) break;
+        if (!strcmp(line, "/reset") || !strcmp(line, "/new")) {
+            if (!qwen_session_reset(session)) {
+                free(line);
+                return 1;
+            }
+            if (tty) fputs("session reset\n", stdout);
+            continue;
+        }
+        if (!strcmp(line, "/help")) {
+            fputs("commands: /reset, /quit\n", stdout);
+            continue;
+        }
+        if (n == 0) continue;
+        if (tty) {
+            fputs("assistant> ", stdout);
+            fflush(stdout);
+        }
+        if (qwen_chat_turn(session, vocab, system, line, think_mode,
+                           n_predict, qwen_emit, qwen_done, &emit,
+                           NULL, NULL)) {
+            free(line);
+            return 1;
+        }
+    }
+    free(line);
+    return 0;
+}
+
 static void qwen_usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s -m MODEL -p PROMPT [-n TOKENS] [-c CONTEXT] "
-            "[--mtp MODEL --mtp-draft 2..16 [--mtp-margin N]] "
-            "[--think|--nothink]\n",
-            argv0);
+            "usage:\n"
+            "  %s -m MODEL -p PROMPT [options]\n"
+            "  %s -m MODEL [--interactive] [options]\n"
+            "  ds4-server -m MODEL [--host HOST] [--port N] [options]\n"
+            "\n"
+            "options: -n TOKENS -c CONTEXT [-sys TEXT] "
+            "[--mtp MODEL --mtp-draft 2..16 [--mtp-margin N]]\n"
+            "         [--think|--nothink] [--interactive] [--server] "
+            "[--cors]\n",
+            argv0, argv0);
 }
 
 static int qwen_acquire_instance_lock(void) {
@@ -3681,17 +3884,27 @@ int main(int argc, char **argv) {
     const char *model_path = NULL;
     const char *mtp_path = NULL;
     const char *prompt_text = NULL;
+    const char *system = "You are a helpful assistant";
+    const char *host = "127.0.0.1";
     int n_predict = 32;
     int ctx_size = 4096;
+    int port = 8000;
     int mtp_draft_tokens = 1;
     float mtp_margin = 3.0f;
     ds4_think_mode think_mode = DS4_THINK_NONE;
+    const char *program = strrchr(argv[0], '/');
+    program = program ? program + 1 : argv[0];
+    bool server_mode = !strcmp(program, "ds4-server");
+    bool interactive = false;
+    bool cors = false;
 
     for (int i = 1; i < argc; i++) {
         if ((!strcmp(argv[i], "-m") || !strcmp(argv[i], "--model")) && i + 1 < argc) {
             model_path = argv[++i];
         } else if ((!strcmp(argv[i], "-p") || !strcmp(argv[i], "--prompt")) && i + 1 < argc) {
             prompt_text = argv[++i];
+        } else if ((!strcmp(argv[i], "-sys") || !strcmp(argv[i], "--system")) && i + 1 < argc) {
+            system = argv[++i];
         } else if ((!strcmp(argv[i], "-n") || !strcmp(argv[i], "--tokens")) && i + 1 < argc) {
             n_predict = atoi(argv[++i]);
         } else if ((!strcmp(argv[i], "-c") || !strcmp(argv[i], "--ctx")) && i + 1 < argc) {
@@ -3713,6 +3926,16 @@ int main(int argc, char **argv) {
             think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(argv[i], "--nothink")) {
             think_mode = DS4_THINK_NONE;
+        } else if (!strcmp(argv[i], "-i") || !strcmp(argv[i], "--interactive")) {
+            interactive = true;
+        } else if (!strcmp(argv[i], "--server")) {
+            server_mode = true;
+        } else if (!strcmp(argv[i], "--host") && i + 1 < argc) {
+            host = argv[++i];
+        } else if (!strcmp(argv[i], "--port") && i + 1 < argc) {
+            port = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--cors")) {
+            cors = true;
         } else if (!strcmp(argv[i], "--metal")) {
             /* Compatibility no-op: Metal is the only backend. */
         } else if (!strcmp(argv[i], "--temp") && i + 1 < argc) {
@@ -3730,9 +3953,11 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
-    if (!model_path || !prompt_text || n_predict < 0 || ctx_size <= 0 ||
+    if (!prompt_text && !server_mode) interactive = true;
+    if (!model_path || n_predict < 0 || ctx_size <= 0 ||
         ctx_size > 262144 || mtp_draft_tokens < 1 || mtp_draft_tokens > 16 ||
-        (mtp_draft_tokens > 1 && !mtp_path)) {
+        (mtp_draft_tokens > 1 && !mtp_path) || port < 1 || port > 65535 ||
+        (server_mode && prompt_text)) {
         qwen_usage(argv[0]);
         return 2;
     }
@@ -3758,8 +3983,9 @@ int main(int argc, char **argv) {
                 mtp_path, qwen_mtp_spec_rows(mtp_draft_tokens));
     }
     qwen_vocab_load(&vocab, &model);
-    qwen_encode_prompt(&vocab, "You are a helpful assistant", prompt_text,
-                       think_mode, &prompt);
+    if (!server_mode && !interactive) {
+        qwen_encode_prompt(&vocab, system, prompt_text, think_mode, &prompt);
+    }
 
     if (!ds4_gpu_init() ||
         !ds4_gpu_set_model_fd(model.fd) ||
@@ -3779,14 +4005,36 @@ int main(int argc, char **argv) {
         close(lock_fd);
         return 1;
     }
-    qwen_emit_ctx emit = {.vocab = &vocab};
-    int rc = generate_qwen_metal_argmax(
-                                         &model, &vocab, &weights,
-                                         mtp_path ? &mtp_model : NULL,
-                                         mtp_path ? &mtp_weights : NULL,
-                                         mtp_draft_tokens, mtp_margin, &prompt,
-                                         n_predict, ctx_size, qwen_emit,
-                                         qwen_done, &emit, NULL, NULL);
+    int rc = 0;
+    if (server_mode || interactive) {
+        qwen_session session;
+        if (!qwen_session_init(&session, &model, &weights,
+                               mtp_path ? &mtp_model : NULL,
+                               mtp_path ? &mtp_weights : NULL,
+                               mtp_draft_tokens, mtp_margin, ctx_size)) {
+            rc = 1;
+        } else if (server_mode) {
+            qwen_http_ctx http = {
+                .session = &session, .vocab = &vocab,
+                .system = system, .fresh = true,
+            };
+            rc = qwen_http_serve(host, port, n_predict,
+                                 ds4_think_mode_enabled(think_mode), cors,
+                                 qwen_http_generate, &http);
+        } else {
+            rc = qwen_interactive(&session, &vocab, system, prompt_text,
+                                  think_mode, n_predict);
+        }
+        qwen_session_free(&session);
+    } else {
+        qwen_emit_ctx emit = {.vocab = &vocab};
+        rc = generate_qwen_metal_argmax(
+            &model, &vocab, &weights,
+            mtp_path ? &mtp_model : NULL,
+            mtp_path ? &mtp_weights : NULL,
+            mtp_draft_tokens, mtp_margin, &prompt,
+            n_predict, ctx_size, qwen_emit, qwen_done, &emit, NULL, NULL);
+    }
     ds4_gpu_cleanup();
     token_vec_free(&prompt);
     vocab_free(&vocab);
