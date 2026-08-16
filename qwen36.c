@@ -3779,10 +3779,6 @@ int main(int argc, char **argv) {
         close(lock_fd);
         return 1;
     }
-    ds4_gpu_set_quality(0);
-    ds4_gpu_set_glm_model(0);
-    ds4_gpu_set_ssd_streaming(0);
-
     qwen_emit_ctx emit = {.vocab = &vocab};
     int rc = generate_qwen_metal_argmax(
                                          &model, &vocab, &weights,

@@ -53,13 +53,15 @@ Unexpected GGUF metadata or tensor layouts fail early.
 - Speculative verification can perform top-k on GPU, elide the recurrent-state
   snapshot, fuse draft-cache catch-up, and retain accepted Gated DeltaNet
   frontiers without replaying target layers.
-- The original Metal implementation and shader set are byte-for-byte retained,
-  including Q8_0 matmuls and the optional decode-fusion experiments.
+- The Qwen, dense, and FlashAttention kernel bodies are unchanged, including
+  every Q8_0 matmul specialization and optional decode-fusion experiment.
+- The Metal library contains only kernels reachable from the Qwen target and
+  NextN graphs. Static and shape-specialized pipeline selection is preserved.
 
-Keeping all Metal sources is intentional. `ds4_metal.m` builds a shared kernel
-library and eagerly creates a broad pipeline set during initialization; pruning
-that substrate would introduce a separate performance and correctness risk.
-This branch minimizes the host semantics around it instead.
+The backend reduction follows the graph rather than replacing it: trace the 43
+GPU calls made by `qwen36.c`, retain their transitive Objective-C helpers, then
+retain the Metal entry points those helpers load. That removes other model
+families without simplifying Qwen's hot graph or its kernels.
 
 ## Build and run
 
@@ -130,13 +132,16 @@ a deterministic live-model smoke test.
 
 The original default macOS CLI compiled 159023 implementation lines: 132228
 lines of C/Objective-C plus 26795 lines of runtime-compiled Metal. This branch
-compiles 75200: 3802 in the Qwen-only host, the unchanged 44603-line Metal
-backend, and the same 26795 shader lines.
+compiles 16211: 3798 in the Qwen host, 6094 in the Qwen-only Metal backend, and
+6319 in its nine runtime-compiled shader files. The public GPU header is another
+442 lines, down from 3196.
 
 | Surface | Before | After | Removed |
 |---|---:|---:|---:|
-| Main host engine | 70897 | 3802 | 67095 (94.6%) |
-| Compiled implementation | 159023 | 75200 | 83823 (52.7%) |
+| Main host engine | 70897 | 3798 | 67099 (94.6%) |
+| Metal host backend | 44603 | 6094 | 38509 (86.3%) |
+| Runtime Metal shaders | 26795 | 6319 | 20476 (76.4%) |
+| Compiled implementation | 159023 | 16211 | 142812 (89.8%) |
 
 The repository also loses millions of lines of generated experiment fixtures,
 but those are not counted as inference-engine simplification.
@@ -147,29 +152,19 @@ execution, eval/benchmark products, and optional support-model speculative
 decoding for other model families. The retained Qwen target and NextN paths
 use the same hot graphs and Metal kernels as the original.
 
-On an Apple M4 Pro with `Qwen3.6-27B-Q8_0.gguf`, three alternating 16-token
-runs gave the following means. Decode latency contains 45 timed graph
-evaluations per runtime.
+Final validation used the saved pre-prune binary and this branch on an Apple M4
+Pro. Every comparison used the same Q8_0 files and peak MTP settings; measured
+ordinary and speculative outputs were identical.
 
-| Runtime | Prefill | Generation | Decode evaluation |
+| Gate | Pre-prune | Minimal | Change |
 |---|---:|---:|---:|
-| Original CLI | 73.30 tok/s | 9.41 tok/s | 113.388 ms |
-| Minimal CLI | 74.13 tok/s | 9.45 tok/s | 112.827 ms |
+| Long-prompt prefill, 5-run median | 66.08 tok/s | 71.08 tok/s | +7.6% |
+| Ordinary generation, 3 alternating-run median | 5.48 tok/s | 5.63 tok/s | +2.7% |
+| MTP total cycle, 37-cycle median | 395.087 ms | 373.319 ms | -5.5% |
 
-The difference is measurement noise; the generated-token path is unchanged.
-
-The MTP path was measured separately with GPU top-k, snapshot elision, and
-fused catch-up enabled on both binaries. Three alternating 80-token runs had
-identical output and identical verifier statistics (47/47 drafts accepted in
-each measured run):
-
-| Runtime | Median prefill | Median speculative generation |
-|---|---:|---:|
-| Original CLI | 71.68 tok/s | 16.49 tok/s |
-| Minimal CLI | 71.18 tok/s | 16.56 tok/s |
-
-The 0.4% generation difference is measurement noise; peak speculative latency
-is preserved.
+The absolute throughput varied with mmap residency pressure, so the decode
+gate also compares the per-cycle medians within a longer run. The reduced
+runtime did not lose peak prefill, ordinary decode, or speculative performance.
 
 ## Scope
 
